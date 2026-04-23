@@ -4,7 +4,7 @@ import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
 import { TaskPriority, TaskStatus } from '@prisma/client';
 import { env } from './lib/env';
-import { buildCreateTaskModal, buildDueDateModal, buildPriorityModal } from './blocks/modals';
+import { buildCreateTaskModal, buildDueDateModal, buildPriorityModal, buildSlashTodoModal } from './blocks/modals';
 import { singleTaskBlocks, taskListBlocks } from './blocks/taskBlocks';
 import { fetchContextSnippet } from './lib/context';
 import { sanitizeTaskTitle } from './lib/format';
@@ -45,10 +45,30 @@ function taskCreatedEphemeralBlocks(task: any) {
           type: 'button',
           text: {
             type: 'plain_text',
-            text: 'Clear'
+            text: 'Clear Msg'
           },
           action_id: 'clear_ephemeral_message',
-          value: String(task.id)
+          value: 'clear'
+        }
+      ]
+    }
+  ];
+}
+
+function listWithClearBlocks(title: string, tasks: any[]) {
+  return [
+    ...taskListBlocks(title, tasks),
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: 'Clear Msg'
+          },
+          action_id: 'clear_ephemeral_message',
+          value: 'clear'
         }
       ]
     }
@@ -96,7 +116,19 @@ async function createTaskFromMessage(args: {
   });
 }
 
-async function sendTaskCreatedDm(task: { id: number; title: string; creatorChannelId: string; sourceMessageLink?: string | null; contextSnippet?: string | null; priority: TaskPriority; status: TaskStatus; dueDate?: Date | null }, userId: string) {
+async function sendTaskCreatedDm(
+  task: {
+    id: number;
+    title: string;
+    creatorChannelId: string;
+    sourceMessageLink?: string | null;
+    contextSnippet?: string | null;
+    priority: TaskPriority;
+    status: TaskStatus;
+    dueDate?: Date | null;
+  },
+  userId: string
+) {
   const dm = await app.client.conversations.open({ users: userId });
   const channelId = dm.channel?.id;
   if (!channelId) return;
@@ -109,7 +141,7 @@ async function sendTaskCreatedDm(task: { id: number; title: string; creatorChann
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `✅ *New Task* in <#${task.creatorChannelId}>`
+          text: `✅ *Task created* in <#${task.creatorChannelId}>`
         }
       },
       ...singleTaskBlocks(task as any)
@@ -117,11 +149,11 @@ async function sendTaskCreatedDm(task: { id: number; title: string; creatorChann
   });
 }
 
-app.command('/todo', async ({ ack, command, respond }) => {
+app.command('/todo', async ({ ack, command, client, respond }) => {
   await ack();
 
-  const title = sanitizeTaskTitle(command.text);
-  if (!title) {
+  const initialTitle = sanitizeTaskTitle(command.text);
+  if (!initialTitle) {
     await respond({
       response_type: 'ephemeral',
       text: 'Use `/todo Your task here` inside a creator channel.'
@@ -129,21 +161,17 @@ app.command('/todo', async ({ ack, command, respond }) => {
     return;
   }
 
-  const task = await createTaskFromMessage({
+  const metadata = taskMeta({
     channelId: command.channel_id,
     channelName: command.channel_name,
     userId: command.user_id,
-    userName: command.user_name,
-    text: title
+    userName: command.user_name
   });
 
-  await respond({
-    response_type: 'ephemeral',
-    text: `Created task "${task.title}"`,
-    blocks: taskCreatedEphemeralBlocks(task)
+  await client.views.open({
+    trigger_id: command.trigger_id,
+    view: buildSlashTodoModal(metadata, initialTitle)
   });
-
-  await sendTaskCreatedDm(task, command.user_id);
 });
 
 app.command('/mytodos', async ({ ack, command, respond }) => {
@@ -151,7 +179,7 @@ app.command('/mytodos', async ({ ack, command, respond }) => {
   const tasks = await listTasksForUser(command.user_id);
   await respond({
     response_type: 'ephemeral',
-    blocks: taskListBlocks('My Open Tasks', tasks)
+    blocks: listWithClearBlocks('My Open Tasks', tasks)
   });
 });
 
@@ -160,7 +188,7 @@ app.command('/list', async ({ ack, command, respond }) => {
   const tasks = await listTasksForUser(command.user_id);
   await respond({
     response_type: 'ephemeral',
-    blocks: taskListBlocks('My Open Tasks', tasks)
+    blocks: listWithClearBlocks('My Open Tasks', tasks)
   });
 });
 
@@ -169,7 +197,7 @@ app.command('/todos', async ({ ack, command, respond }) => {
   const tasks = await listTasksForChannel(command.channel_id);
   await respond({
     response_type: 'ephemeral',
-    blocks: taskListBlocks(`Tasks for #${command.channel_name}`, tasks)
+    blocks: listWithClearBlocks(`Tasks for #${command.channel_name}`, tasks)
   });
 });
 
@@ -178,7 +206,7 @@ app.command('/overdue', async ({ ack, command, respond }) => {
   const tasks = await listOverdueTasks(command.user_id);
   await respond({
     response_type: 'ephemeral',
-    blocks: taskListBlocks('My Overdue Tasks', tasks)
+    blocks: listWithClearBlocks('My Overdue Tasks', tasks)
   });
 });
 
@@ -202,7 +230,21 @@ app.command('/today', async ({ ack, command, respond }) => {
         type: 'section',
         text: { type: 'mrkdwn', text }
       },
-      ...taskListBlocks('Overdue First', overdue).slice(0, 6)
+      ...taskListBlocks('Overdue First', overdue).slice(0, 6),
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: {
+              type: 'plain_text',
+              text: 'Clear Msg'
+            },
+            action_id: 'clear_ephemeral_message',
+            value: 'clear'
+          }
+        ]
+      }
     ]
   });
 });
@@ -257,14 +299,93 @@ app.view('create_task_modal_submit', async ({ ack, body, view, client }) => {
     await prisma.task.update({ where: { id: task.id }, data: { notes } });
   }
 
+  const updatedTask = await prisma.task.findUnique({
+    where: { id: task.id }
+  });
+
+  if (!updatedTask) return;
+
   await client.chat.postEphemeral({
     channel: metadata.channelId,
     user: body.user.id,
-    text: `Created task "${task.title}"`,
-    blocks: taskCreatedEphemeralBlocks(task)
+    text: `Created task "${updatedTask.title}"`,
+    blocks: taskCreatedEphemeralBlocks(updatedTask)
   });
 
-  await sendTaskCreatedDm(task, body.user.id);
+  await sendTaskCreatedDm(updatedTask as any, body.user.id);
+});
+
+app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
+  await ack();
+
+  const metadata = JSON.parse(view.private_metadata) as {
+    channelId: string;
+    channelName?: string;
+    userId: string;
+    userName?: string;
+  };
+
+  const title = sanitizeTaskTitle(view.state.values.task_title?.value?.value ?? '');
+  const notes = view.state.values.task_notes?.value?.value ?? undefined;
+  const priority =
+    (view.state.values.priority?.value?.selected_option?.value as TaskPriority | undefined) ??
+    TaskPriority.MEDIUM;
+
+  const date = view.state.values.due_date?.value?.selected_date;
+  const hourRaw = view.state.values.due_time?.value?.value;
+  const parsedHour = hourRaw ? Number(hourRaw) : env.DEFAULT_REMINDER_HOUR;
+  const hour = Number.isFinite(parsedHour)
+    ? Math.min(23, Math.max(0, parsedHour))
+    : env.DEFAULT_REMINDER_HOUR;
+
+  const dueDate = date
+    ? dayjs.tz(
+        `${date} ${String(hour).padStart(2, '0')}:00`,
+        'YYYY-MM-DD HH:mm',
+        env.TIMEZONE
+      ).toDate()
+    : undefined;
+
+  if (!title) {
+    await client.chat.postEphemeral({
+      channel: metadata.channelId,
+      user: body.user.id,
+      text: 'Task title is required.'
+    });
+    return;
+  }
+
+  const task = await createTaskFromMessage({
+    channelId: metadata.channelId,
+    channelName: metadata.channelName,
+    userId: metadata.userId,
+    userName: metadata.userName,
+    text: title
+  });
+
+  await prisma.task.update({
+    where: { id: task.id },
+    data: {
+      notes,
+      priority,
+      dueDate
+    }
+  });
+
+  const updatedTask = await prisma.task.findUnique({
+    where: { id: task.id }
+  });
+
+  if (!updatedTask) return;
+
+  await client.chat.postEphemeral({
+    channel: metadata.channelId,
+    user: body.user.id,
+    text: `Created task "${updatedTask.title}"`,
+    blocks: taskCreatedEphemeralBlocks(updatedTask)
+  });
+
+  await sendTaskCreatedDm(updatedTask as any, body.user.id);
 });
 
 app.event('reaction_added', async ({ event }) => {
@@ -378,8 +499,13 @@ app.view('task_due_date_modal_submit', async ({ ack, view, body, client }) => {
   const { taskId } = JSON.parse(view.private_metadata) as { taskId: number };
   const date = view.state.values.due_date.value.selected_date;
   const hourRaw = view.state.values.due_time?.value?.value;
-  const hour = hourRaw ? Math.min(23, Math.max(0, Number(hourRaw))) : env.DEFAULT_REMINDER_HOUR;
-  const due = date ? dayjs.tz(`${date} ${String(hour).padStart(2, '0')}:00`, 'YYYY-MM-DD HH:mm', env.TIMEZONE).toDate() : null;
+  const parsedHour = hourRaw ? Number(hourRaw) : env.DEFAULT_REMINDER_HOUR;
+  const hour = Number.isFinite(parsedHour)
+    ? Math.min(23, Math.max(0, parsedHour))
+    : env.DEFAULT_REMINDER_HOUR;
+  const due = date
+    ? dayjs.tz(`${date} ${String(hour).padStart(2, '0')}:00`, 'YYYY-MM-DD HH:mm', env.TIMEZONE).toDate()
+    : null;
   const task = await updateTaskDueDate(taskId, due);
   await client.chat.postEphemeral({
     channel: task.creatorChannelId,
