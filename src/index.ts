@@ -35,6 +35,26 @@ function taskMeta(params: Record<string, unknown>): string {
   return JSON.stringify(params);
 }
 
+function taskCreatedEphemeralBlocks(task: any) {
+  return [
+    ...singleTaskBlocks(task),
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: 'Clear'
+          },
+          action_id: 'clear_ephemeral_message',
+          value: String(task.id)
+        }
+      ]
+    }
+  ];
+}
+
 async function createTaskFromMessage(args: {
   channelId: string;
   channelName?: string;
@@ -89,7 +109,7 @@ async function sendTaskCreatedDm(task: { id: number; title: string; creatorChann
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `✅ *Task created* in <#${task.creatorChannelId}>`
+          text: `✅ *New Task* in <#${task.creatorChannelId}>`
         }
       },
       ...singleTaskBlocks(task as any)
@@ -119,8 +139,8 @@ app.command('/todo', async ({ ack, command, respond }) => {
 
   await respond({
     response_type: 'ephemeral',
-    text: `Created task #${task.id}`,
-    blocks: singleTaskBlocks(task)
+    text: `Created task "${task.title}"`,
+    blocks: taskCreatedEphemeralBlocks(task)
   });
 
   await sendTaskCreatedDm(task, command.user_id);
@@ -240,8 +260,8 @@ app.view('create_task_modal_submit', async ({ ack, body, view, client }) => {
   await client.chat.postEphemeral({
     channel: metadata.channelId,
     user: body.user.id,
-    text: `Created task #${task.id}`,
-    blocks: singleTaskBlocks(task)
+    text: `Created task "${task.title}"`,
+    blocks: taskCreatedEphemeralBlocks(task)
   });
 
   await sendTaskCreatedDm(task, body.user.id);
@@ -294,8 +314,8 @@ app.event('reaction_added', async ({ event }) => {
   await app.client.chat.postEphemeral({
     channel: channelId,
     user: event.user,
-    text: `Created task #${task.id} from reaction`,
-    blocks: singleTaskBlocks(task)
+    text: `Created task "${task.title}" from reaction`,
+    blocks: taskCreatedEphemeralBlocks(task)
   });
 });
 
@@ -309,7 +329,14 @@ app.action('task_mark_done', async ({ ack, body, action, client }) => {
   await client.chat.postEphemeral({
     channel,
     user: userId,
-    text: `Task #${task.id} marked done.`
+    text: `✅ Task "${task.title}" marked as done`
+  });
+});
+
+app.action('clear_ephemeral_message', async ({ ack, respond }) => {
+  await ack();
+  await respond({
+    delete_original: true
   });
 });
 
@@ -341,7 +368,7 @@ app.view('task_priority_modal_submit', async ({ ack, view, body, client }) => {
   await client.chat.postEphemeral({
     channel: task.creatorChannelId,
     user: body.user.id,
-    text: `Updated task #${task.id} priority to ${task.priority}.`,
+    text: `Updated task "${task.title}" priority to ${task.priority}.`,
     blocks: singleTaskBlocks(task)
   });
 });
@@ -357,7 +384,7 @@ app.view('task_due_date_modal_submit', async ({ ack, view, body, client }) => {
   await client.chat.postEphemeral({
     channel: task.creatorChannelId,
     user: body.user.id,
-    text: `Updated task #${task.id} due date.`,
+    text: `Updated due date for "${task.title}".`,
     blocks: singleTaskBlocks(task)
   });
 });
