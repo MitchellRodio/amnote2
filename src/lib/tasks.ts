@@ -1,6 +1,13 @@
 import { Task, TaskPriority, TaskStatus } from '@prisma/client';
+import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
+import timezone from 'dayjs/plugin/timezone';
 import { prisma } from './db';
+import { env } from './env';
 import { createHubSpotTask, updateHubSpotTask } from './hubspot';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 export type CreateTaskInput = {
   title: string;
@@ -163,4 +170,58 @@ export async function taskCountsForToday(userId: string): Promise<{ total: numbe
   ]);
 
   return { total, overdue, high };
+}
+
+
+function todayRangeInTimezone() {
+  const start = dayjs().tz(env.TIMEZONE).startOf('day').toDate();
+  const end = dayjs().tz(env.TIMEZONE).endOf('day').toDate();
+  return { start, end };
+}
+
+export async function listTasksDueTodayForUser(userId: string): Promise<Task[]> {
+  const { start, end } = todayRangeInTimezone();
+  return prisma.task.findMany({
+    where: {
+      assignedToUserId: userId,
+      status: {
+        not: TaskStatus.DONE
+      },
+      dueDate: {
+        gte: start,
+        lte: end
+      }
+    },
+    orderBy: [
+      { dueDate: 'asc' },
+      { priority: 'desc' },
+      { createdAt: 'asc' }
+    ]
+  });
+}
+
+export async function listUsersWithTasksDueToday(): Promise<string[]> {
+  const { start, end } = todayRangeInTimezone();
+  const rows = await prisma.task.findMany({
+    where: {
+      assignedToUserId: {
+        not: null
+      },
+      status: {
+        not: TaskStatus.DONE
+      },
+      dueDate: {
+        gte: start,
+        lte: end
+      }
+    },
+    select: {
+      assignedToUserId: true
+    },
+    distinct: ['assignedToUserId']
+  });
+
+  return rows
+    .map((row) => row.assignedToUserId)
+    .filter((userId): userId is string => Boolean(userId));
 }

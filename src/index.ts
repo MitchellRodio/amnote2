@@ -20,6 +20,7 @@ import {
 } from './lib/tasks';
 import { prisma } from './lib/db';
 import { findCompanyForChannel, saveChannelLink, searchCompanies, updateHubSpotTask } from './lib/hubspot';
+import { registerReminderJobs } from './lib/reminders';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -426,6 +427,8 @@ app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
     console.error('HubSpot task sync failed after slash modal submit', error);
   }
 
+  if (!updatedTask) return;
+
   await client.chat.postEphemeral({
     channel: metadata.channelId,
     user: body.user.id,
@@ -564,6 +567,7 @@ app.view('task_due_date_modal_submit', async ({ ack, view, body, client }) => {
 });
 
 async function start() {
+  registerReminderJobs(app);
   await app.start();
   console.log('⚡️ Creator Tasks Slack app is running');
 }
