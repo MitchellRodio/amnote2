@@ -45,6 +45,12 @@
         "description": "Show my daily task summary",
         "usage_hint": "/today",
         "should_escape": false
+      },
+      {
+        "command": "/link",
+        "description": "Link the current creator channel to a HubSpot company",
+        "usage_hint": "/link ToolSuite or /link 123456",
+        "should_escape": false
       }
     ],
     "shortcuts": [

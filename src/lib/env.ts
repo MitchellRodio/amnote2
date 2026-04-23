@@ -15,7 +15,9 @@ const envSchema = z.object({
   HUBSPOT_ACCESS_TOKEN: z.string().optional(),
   HUBSPOT_BASE_URL: z.string().optional().default('https://api.hubapi.com'),
   HUBSPOT_CHANNEL_PREFIXES: z.string().optional().default('whop-x-,whop-'),
-  HUBSPOT_COMPANY_OVERRIDES: z.string().optional().default('{}')
+  HUBSPOT_COMPANY_OVERRIDES: z.string().optional().default('{}'),
+  HUBSPOT_OWNER_ID: z.string().optional(),
+  HUBSPOT_OWNER_EMAIL: z.string().optional()
 });
 
 export const env = envSchema.parse(process.env);

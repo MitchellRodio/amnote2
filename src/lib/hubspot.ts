@@ -1,5 +1,6 @@
-import { Task, TaskPriority, TaskStatus } from '@prisma/client';
+import { ChannelLink, Task, TaskPriority, TaskStatus } from '@prisma/client';
 import { env } from './env';
+import { prisma } from './db';
 
 type HubSpotCompany = {
   id: string;
@@ -7,6 +8,14 @@ type HubSpotCompany = {
     name?: string;
     hs_name?: string;
   };
+};
+
+type HubSpotOwner = {
+  id: string;
+  email?: string;
+  firstName?: string;
+  lastName?: string;
+  archived?: boolean;
 };
 
 function enabled(): boolean {
@@ -34,6 +43,16 @@ function normalizeForMatch(input?: string | null): string {
     .replace(/\s+/g, '');
 }
 
+function normalizeWords(input?: string | null): string {
+  return (input ?? '')
+    .toLowerCase()
+    .replace(/^whop-x-/, '')
+    .replace(/^whop-/, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
 export function deriveCompanySearchTerms(channelName?: string | null): string[] {
   if (!channelName) return [];
 
@@ -49,7 +68,7 @@ export function deriveCompanySearchTerms(channelName?: string | null): string[] 
   const base = stripped.replace(/^[-_]+/, '').trim();
   if (!base) return [];
 
-  const rawWords = base.split(/[-_]+/).filter(Boolean);
+  const rawWords = base.split(/[-_ ]+/).filter(Boolean);
   const titleCase = rawWords
     .map((word) => {
       if (!word) return word;
@@ -58,7 +77,14 @@ export function deriveCompanySearchTerms(channelName?: string | null): string[] 
     })
     .join(' ');
 
-  return Array.from(new Set([base, base.replace(/[-_]+/g, ' '), titleCase]));
+  const compact = rawWords.join('');
+
+  return Array.from(new Set([
+    base,
+    base.replace(/[-_]+/g, ' '),
+    titleCase,
+    compact
+  ]));
 }
 
 async function hubspotFetch<T>(path: string, init: RequestInit): Promise<T> {
@@ -90,49 +116,152 @@ function getOverrides(): Record<string, string> {
   }
 }
 
-export async function findCompanyForChannel(channelName?: string | null): Promise<HubSpotCompany | null> {
+async function getSavedChannelLink(channelId?: string | null): Promise<ChannelLink | null> {
+  if (!channelId) return null;
+  return prisma.channelLink.findUnique({ where: { slackChannelId: channelId } });
+}
+
+export async function saveChannelLink(args: {
+  slackChannelId: string;
+  slackChannelName?: string | null;
+  hubspotCompanyId: string;
+  hubspotCompanyName?: string | null;
+}): Promise<ChannelLink> {
+  return prisma.channelLink.upsert({
+    where: { slackChannelId: args.slackChannelId },
+    update: {
+      slackChannelName: args.slackChannelName ?? undefined,
+      hubspotCompanyId: args.hubspotCompanyId,
+      hubspotCompanyName: args.hubspotCompanyName ?? undefined
+    },
+    create: {
+      slackChannelId: args.slackChannelId,
+      slackChannelName: args.slackChannelName ?? undefined,
+      hubspotCompanyId: args.hubspotCompanyId,
+      hubspotCompanyName: args.hubspotCompanyName ?? undefined
+    }
+  });
+}
+
+async function getCompanyById(id: string): Promise<HubSpotCompany | null> {
   if (!enabled()) return null;
+  const company = await hubspotFetch<HubSpotCompany>(`/crm/v3/objects/companies/${id}?properties=name,hs_name`, {
+    method: 'GET'
+  });
+  return company;
+}
+
+export async function searchCompanies(query: string): Promise<HubSpotCompany[]> {
+  if (!enabled()) return [];
+  const result = await hubspotFetch<{ results: HubSpotCompany[] }>(`/crm/v3/objects/companies/search`, {
+    method: 'POST',
+    body: JSON.stringify({
+      query,
+      properties: ['name', 'hs_name'],
+      limit: 10
+    })
+  });
+  return result.results ?? [];
+}
+
+function companyScore(company: HubSpotCompany, targetChannelName?: string | null): number {
+  const companyName = company.properties?.name ?? company.properties?.hs_name ?? '';
+  const targetCompact = normalizeForMatch(targetChannelName);
+  const targetWords = normalizeWords(targetChannelName);
+  const companyCompact = normalizeForMatch(companyName);
+  const companyWords = normalizeWords(companyName);
+
+  let score = 0;
+  if (companyCompact === targetCompact) score += 100;
+  if (companyWords === targetWords) score += 90;
+  if (companyCompact.includes(targetCompact) || targetCompact.includes(companyCompact)) score += 50;
+
+  const targetTokens = new Set(targetWords.split(' ').filter(Boolean));
+  const companyTokens = new Set(companyWords.split(' ').filter(Boolean));
+  let overlap = 0;
+  for (const token of targetTokens) {
+    if (companyTokens.has(token)) overlap += 1;
+  }
+  score += overlap * 10;
+  return score;
+}
+
+export async function findCompanyForChannel(args: { channelId?: string | null; channelName?: string | null }): Promise<HubSpotCompany | null> {
+  if (!enabled()) return null;
+
+  const saved = await getSavedChannelLink(args.channelId);
+  if (saved) {
+    return {
+      id: saved.hubspotCompanyId,
+      properties: { name: saved.hubspotCompanyName ?? undefined, hs_name: saved.hubspotCompanyName ?? undefined }
+    };
+  }
+
+  const channelName = args.channelName;
   if (!channelName) return null;
 
   const overrides = getOverrides();
   const overrideValue = overrides[channelName] ?? overrides[normalizeForMatch(channelName)];
   if (overrideValue) {
     if (/^\d+$/.test(overrideValue)) {
-      const company = await hubspotFetch<{ id: string; properties?: { name?: string; hs_name?: string } }>(`/crm/v3/objects/companies/${overrideValue}?properties=name,hs_name`, {
-        method: 'GET'
-      });
+      const company = await getCompanyById(overrideValue);
+      if (company && args.channelId) {
+        await saveChannelLink({
+          slackChannelId: args.channelId,
+          slackChannelName: channelName,
+          hubspotCompanyId: company.id,
+          hubspotCompanyName: company.properties?.name ?? company.properties?.hs_name
+        });
+      }
       return company;
     }
 
-    return { id: '', properties: { name: overrideValue, hs_name: overrideValue } };
+    const results = await searchCompanies(overrideValue);
+    const company = results[0] ?? null;
+    if (company && args.channelId) {
+      await saveChannelLink({
+        slackChannelId: args.channelId,
+        slackChannelName: channelName,
+        hubspotCompanyId: company.id,
+        hubspotCompanyName: company.properties?.name ?? company.properties?.hs_name
+      });
+    }
+    return company;
   }
 
   const searchTerms = deriveCompanySearchTerms(channelName);
-  const target = normalizeForMatch(channelName);
+  let best: HubSpotCompany | null = null;
+  let bestScore = -1;
 
   for (const term of searchTerms) {
-    const payload = {
-      query: term,
-      properties: ['name', 'hs_name'],
-      limit: 10
-    };
-
     const result = await hubspotFetch<{ results: HubSpotCompany[] }>(`/crm/v3/objects/companies/search`, {
       method: 'POST',
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        query: term,
+        properties: ['name', 'hs_name'],
+        limit: 10
+      })
     });
 
-    const best = result.results.find((company) => {
-      const name = company.properties?.name ?? company.properties?.hs_name ?? '';
-      return normalizeForMatch(name) === target || normalizeForMatch(name) === normalizeForMatch(term);
-    }) ?? result.results[0];
-
-    if (best) {
-      return best;
+    for (const company of result.results ?? []) {
+      const score = companyScore(company, channelName);
+      if (score > bestScore) {
+        best = company;
+        bestScore = score;
+      }
     }
   }
 
-  return null;
+  if (best && args.channelId) {
+    await saveChannelLink({
+      slackChannelId: args.channelId,
+      slackChannelName: channelName,
+      hubspotCompanyId: best.id,
+      hubspotCompanyName: best.properties?.name ?? best.properties?.hs_name
+    });
+  }
+
+  return best;
 }
 
 function mapPriority(priority: TaskPriority): 'LOW' | 'MEDIUM' | 'HIGH' {
@@ -158,16 +287,39 @@ function buildTaskBody(task: Task): string {
   ].filter(Boolean).join('\n\n');
 }
 
+let ownerCache: { email: string; id: string } | null = null;
+
+export async function resolveHubSpotOwnerId(): Promise<string | undefined> {
+  if (!enabled()) return undefined;
+  if (env.HUBSPOT_OWNER_ID) return env.HUBSPOT_OWNER_ID;
+  if (!env.HUBSPOT_OWNER_EMAIL) return undefined;
+
+  if (ownerCache && ownerCache.email.toLowerCase() === env.HUBSPOT_OWNER_EMAIL.toLowerCase()) {
+    return ownerCache.id;
+  }
+
+  const owners = await hubspotFetch<{ results: HubSpotOwner[] }>(`/crm/v3/owners`, { method: 'GET' });
+  const match = (owners.results ?? []).find((owner) => (owner.email ?? '').toLowerCase() === env.HUBSPOT_OWNER_EMAIL?.toLowerCase());
+  if (match?.id) {
+    ownerCache = { email: env.HUBSPOT_OWNER_EMAIL, id: match.id };
+    return match.id;
+  }
+
+  return undefined;
+}
+
 export async function createHubSpotTask(task: Task): Promise<{ hubspotTaskId: string; hubspotCompanyId?: string; hubspotCompanyName?: string } | null> {
   if (!enabled()) return null;
 
-  const company = await findCompanyForChannel(task.creatorChannelName);
+  const company = await findCompanyForChannel({ channelId: task.creatorChannelId, channelName: task.creatorChannelName });
+  const ownerId = await resolveHubSpotOwnerId();
 
   const payload: Record<string, unknown> = {
     engagement: {
       active: true,
       type: 'TASK',
-      timestamp: taskTimestamp(task)
+      timestamp: taskTimestamp(task),
+      ...(ownerId ? { ownerId: Number(ownerId) } : {})
     },
     associations: {
       companyIds: company?.id ? [Number(company.id)] : []
@@ -195,6 +347,7 @@ export async function createHubSpotTask(task: Task): Promise<{ hubspotTaskId: st
 
 export async function updateHubSpotTask(task: Task): Promise<void> {
   if (!enabled() || !task.hubspotTaskId) return;
+  const ownerId = await resolveHubSpotOwnerId();
 
   await hubspotFetch(`/engagements/v1/engagements/${task.hubspotTaskId}`, {
     method: 'PATCH',
@@ -202,7 +355,8 @@ export async function updateHubSpotTask(task: Task): Promise<void> {
       engagement: {
         active: true,
         type: 'TASK',
-        timestamp: taskTimestamp(task)
+        timestamp: taskTimestamp(task),
+        ...(ownerId ? { ownerId: Number(ownerId) } : {})
       },
       metadata: {
         subject: task.title,

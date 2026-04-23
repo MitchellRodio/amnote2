@@ -19,6 +19,7 @@ import {
   updateTaskStatus
 } from './lib/tasks';
 import { prisma } from './lib/db';
+import { findCompanyForChannel, saveChannelLink, searchCompanies } from './lib/hubspot';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -171,6 +172,53 @@ app.command('/todo', async ({ ack, command, client, respond }) => {
   await client.views.open({
     trigger_id: command.trigger_id,
     view: buildSlashTodoModal(metadata, initialTitle)
+  });
+});
+
+app.command('/link', async ({ ack, command, respond }) => {
+  await ack();
+
+  const raw = command.text.trim();
+  if (!raw) {
+    await respond({
+      response_type: 'ephemeral',
+      text: 'Use `/link <HubSpot company ID or company name>` in the creator channel you want to link.'
+    });
+    return;
+  }
+
+  let company = null;
+  if (/^\d+$/.test(raw)) {
+    const matched = await findCompanyForChannel({ channelId: undefined, channelName: raw });
+    company = matched;
+    if (!company || company.id !== raw) {
+      const results = await searchCompanies(raw);
+      company = results.find((item) => item.id === raw) ?? null;
+    }
+  } else {
+    const results = await searchCompanies(raw);
+    company = results[0] ?? null;
+  }
+
+  if (!company?.id) {
+    await respond({
+      response_type: 'ephemeral',
+      text: `Could not find a HubSpot company for "${raw}".`
+    });
+    return;
+  }
+
+  const companyName = company.properties?.name ?? company.properties?.hs_name ?? company.id;
+  await saveChannelLink({
+    slackChannelId: command.channel_id,
+    slackChannelName: command.channel_name,
+    hubspotCompanyId: company.id,
+    hubspotCompanyName: companyName
+  });
+
+  await respond({
+    response_type: 'ephemeral',
+    text: `Linked this channel to HubSpot company *${companyName}* (${company.id}).`
   });
 });
 
