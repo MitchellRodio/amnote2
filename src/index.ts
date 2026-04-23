@@ -220,8 +220,8 @@ app.view('create_task_modal_submit', async ({ ack, body, view, client }) => {
     userName?: string;
   };
 
-  const title = view.state.values.task_title.value.value;
-  const notes = view.state.values.task_notes?.value?.value;
+  const title = view.state.values.task_title?.value?.value ?? '';
+  const notes = view.state.values.task_notes?.value?.value ?? undefined;
 
   const task = await createTaskFromMessage({
     channelId: metadata.channelId,
@@ -301,9 +301,9 @@ app.event('reaction_added', async ({ event }) => {
 
 app.action('task_mark_done', async ({ ack, body, action, client }) => {
   await ack();
-  const taskId = Number(action.value);
+  const taskId = Number('value' in action && typeof action.value === 'string' ? action.value : '0');
   const task = await updateTaskStatus(taskId, TaskStatus.DONE);
-  const channel = 'channel' in body && body.channel ? body.channel.id : task.creatorChannelId;
+  const channel = ('channel' in body && body.channel?.id) ? body.channel.id : task.creatorChannelId;
   const userId = body.user.id;
 
   await client.chat.postEphemeral({
@@ -315,17 +315,21 @@ app.action('task_mark_done', async ({ ack, body, action, client }) => {
 
 app.action('task_open_priority_modal', async ({ ack, body, action, client }) => {
   await ack();
+  if (!('trigger_id' in body) || typeof body.trigger_id !== 'string') return;
+  const taskId = Number('value' in action && typeof action.value === 'string' ? action.value : '0');
   await client.views.open({
     trigger_id: body.trigger_id,
-    view: buildPriorityModal(Number(action.value))
+    view: buildPriorityModal(taskId)
   });
 });
 
 app.action('task_open_due_date_modal', async ({ ack, body, action, client }) => {
   await ack();
+  if (!('trigger_id' in body) || typeof body.trigger_id !== 'string') return;
+  const taskId = Number('value' in action && typeof action.value === 'string' ? action.value : '0');
   await client.views.open({
     trigger_id: body.trigger_id,
-    view: buildDueDateModal(Number(action.value))
+    view: buildDueDateModal(taskId)
   });
 });
 

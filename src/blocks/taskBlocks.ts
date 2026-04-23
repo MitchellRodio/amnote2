@@ -1,8 +1,7 @@
-import { KnownBlock, Block, MrkdwnElement } from '@slack/bolt';
 import { Task } from '@prisma/client';
 import { formatDueDate, humanizePriority, humanizeStatus, truncate } from '../lib/format';
 
-function actionsForTask(task: Task): Block {
+function actionsForTask(task: Task): any {
   return {
     type: 'actions',
     elements: [
@@ -31,21 +30,21 @@ function actionsForTask(task: Task): Block {
             text: { type: 'plain_text', text: 'View Source' },
             url: task.sourceMessageLink,
             action_id: 'task_view_source'
-          } as const]
+          }]
         : [])
     ]
   };
 }
 
-export function singleTaskBlocks(task: Task): (KnownBlock | Block)[] {
-  const fields: MrkdwnElement[] = [
+export function singleTaskBlocks(task: Task): any[] {
+  const fields = [
     { type: 'mrkdwn', text: `*Status*\n${humanizeStatus(task.status)}` },
     { type: 'mrkdwn', text: `*Priority*\n${humanizePriority(task.priority)}` },
     { type: 'mrkdwn', text: `*Due*\n${formatDueDate(task.dueDate)}` },
     { type: 'mrkdwn', text: `*Creator*\n<#${task.creatorChannelId}>` }
   ];
 
-  const blocks: (KnownBlock | Block)[] = [
+  const blocks: any[] = [
     {
       type: 'header',
       text: { type: 'plain_text', text: `Task #${task.id}` }
@@ -68,7 +67,7 @@ export function singleTaskBlocks(task: Task): (KnownBlock | Block)[] {
   return blocks;
 }
 
-export function taskListBlocks(title: string, tasks: Task[]): (KnownBlock | Block)[] {
+export function taskListBlocks(title: string, tasks: Task[]): any[] {
   if (!tasks.length) {
     return [
       {
@@ -78,7 +77,7 @@ export function taskListBlocks(title: string, tasks: Task[]): (KnownBlock | Bloc
     ];
   }
 
-  const blocks: (KnownBlock | Block)[] = [
+  const blocks: any[] = [
     {
       type: 'header',
       text: { type: 'plain_text', text: title }
