@@ -19,7 +19,7 @@ import {
   updateTaskStatus
 } from './lib/tasks';
 import { prisma } from './lib/db';
-import { findCompanyForChannel, saveChannelLink, searchCompanies } from './lib/hubspot';
+import { findCompanyForChannel, saveChannelLink, searchCompanies, updateHubSpotTask } from './lib/hubspot';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -411,7 +411,7 @@ app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
     text: title
   });
 
-  await prisma.task.update({
+  const updatedTask = await prisma.task.update({
     where: { id: task.id },
     data: {
       notes,
@@ -420,11 +420,11 @@ app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
     }
   });
 
-  const updatedTask = await prisma.task.findUnique({
-    where: { id: task.id }
-  });
-
-  if (!updatedTask) return;
+  try {
+    await updateHubSpotTask(updatedTask);
+  } catch (error) {
+    console.error('HubSpot task sync failed after slash modal submit', error);
+  }
 
   await client.chat.postEphemeral({
     channel: metadata.channelId,
