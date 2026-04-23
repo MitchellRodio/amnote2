@@ -54,7 +54,7 @@ export function singleTaskBlocks(task: Task): any[] {
   const blocks: any[] = [
     {
       type: 'header',
-      text: { type: 'plain_text', text: `Task #${task.id}` }
+      text: { type: 'plain_text', text: `Task ${truncate(task.title, 120)}` }
     },
     {
       type: 'section',
@@ -97,7 +97,7 @@ export function taskListBlocks(title: string, tasks: Task[]): any[] {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*#${task.id}* ${task.title}\n• ${humanizePriority(task.priority)} priority\n• Due: ${formatDueDate(task.dueDate)}\n• Creator: <#${task.creatorChannelId}>${companyLine}${task.sourceMessageLink ? `\n• <${task.sourceMessageLink}|Open source message>` : ''}`
+        text: `*Task* ${task.title}\n• ${humanizePriority(task.priority)} priority\n• Due: ${formatDueDate(task.dueDate)}\n• Creator: <#${task.creatorChannelId}>${companyLine}${task.sourceMessageLink ? `\n• <${task.sourceMessageLink}|Open source message>` : ''}`
       },
       accessory: {
         type: 'button',

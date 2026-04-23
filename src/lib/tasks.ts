@@ -66,7 +66,6 @@ export async function listTasksForUser(userId: string): Promise<Task[]> {
     },
     orderBy: [
       { priority: 'desc' },
-      { dueDate: 'asc' },
       { createdAt: 'desc' }
     ]
   });
@@ -82,7 +81,6 @@ export async function listTasksForChannel(channelId: string): Promise<Task[]> {
     },
     orderBy: [
       { priority: 'desc' },
-      { dueDate: 'asc' },
       { createdAt: 'desc' }
     ]
   });
