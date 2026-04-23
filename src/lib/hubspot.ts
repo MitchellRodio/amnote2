@@ -105,6 +105,11 @@ async function hubspotFetch<T>(path: string, init: RequestInit): Promise<T> {
     return undefined as T;
   }
 
+  const contentType = response.headers.get('content-type') ?? '';
+  if (!contentType.includes('application/json')) {
+    return undefined as T;
+  }
+
   return response.json() as Promise<T>;
 }
 
@@ -274,8 +279,8 @@ function mapStatus(status: TaskStatus): 'COMPLETED' | 'NOT_STARTED' {
   return status === TaskStatus.DONE ? 'COMPLETED' : 'NOT_STARTED';
 }
 
-function taskTimestamp(task: Pick<Task, 'dueDate' | 'createdAt'>): number {
-  return (task.dueDate ?? task.createdAt).getTime();
+function taskTimestamp(task: Pick<Task, 'dueDate' | 'createdAt'>): string {
+  return new Date(task.dueDate ?? task.createdAt).toISOString();
 }
 
 function buildTaskBody(task: Task): string {
@@ -308,38 +313,44 @@ export async function resolveHubSpotOwnerId(): Promise<string | undefined> {
   return undefined;
 }
 
+async function associateTaskToCompany(taskId: string, companyId: string): Promise<void> {
+  if (!enabled()) return;
+
+  await hubspotFetch<void>(`/crm/v4/objects/task/${taskId}/associations/default/company/${companyId}`, {
+    method: 'PUT'
+  });
+}
+
 export async function createHubSpotTask(task: Task): Promise<{ hubspotTaskId: string; hubspotCompanyId?: string; hubspotCompanyName?: string } | null> {
   if (!enabled()) return null;
 
   const company = await findCompanyForChannel({ channelId: task.creatorChannelId, channelName: task.creatorChannelName });
   const ownerId = await resolveHubSpotOwnerId();
 
-  const payload: Record<string, unknown> = {
-    engagement: {
-      active: true,
-      type: 'TASK',
-      timestamp: taskTimestamp(task),
-      ...(ownerId ? { ownerId: Number(ownerId) } : {})
-    },
-    associations: {
-      companyIds: company?.id ? [Number(company.id)] : []
-    },
-    attachments: [],
-    metadata: {
-      subject: task.title,
-      body: buildTaskBody(task) || 'Created from Slack',
-      status: mapStatus(task.status),
-      priority: mapPriority(task.priority)
+  const payload: {
+    properties: Record<string, string>;
+  } = {
+    properties: {
+      hs_task_subject: task.title,
+      hs_task_body: buildTaskBody(task) || 'Created from Slack',
+      hs_task_status: mapStatus(task.status),
+      hs_task_priority: mapPriority(task.priority),
+      hs_timestamp: taskTimestamp(task),
+      ...(ownerId ? { hubspot_owner_id: ownerId } : {})
     }
   };
 
-  const created = await hubspotFetch<{ engagement: { id: number | string } }>(`/engagements/v1/engagements`, {
+  const created = await hubspotFetch<{ id: string }>(`/crm/v3/objects/tasks`, {
     method: 'POST',
     body: JSON.stringify(payload)
   });
 
+  if (company?.id) {
+    await associateTaskToCompany(created.id, company.id);
+  }
+
   return {
-    hubspotTaskId: String(created.engagement.id),
+    hubspotTaskId: String(created.id),
     hubspotCompanyId: company?.id,
     hubspotCompanyName: company?.properties?.name ?? company?.properties?.hs_name
   };
@@ -347,22 +358,19 @@ export async function createHubSpotTask(task: Task): Promise<{ hubspotTaskId: st
 
 export async function updateHubSpotTask(task: Task): Promise<void> {
   if (!enabled() || !task.hubspotTaskId) return;
+
   const ownerId = await resolveHubSpotOwnerId();
 
-  await hubspotFetch(`/engagements/v1/engagements/${task.hubspotTaskId}`, {
+  await hubspotFetch(`/crm/v3/objects/tasks/${task.hubspotTaskId}`, {
     method: 'PATCH',
     body: JSON.stringify({
-      engagement: {
-        active: true,
-        type: 'TASK',
-        timestamp: taskTimestamp(task),
-        ...(ownerId ? { ownerId: Number(ownerId) } : {})
-      },
-      metadata: {
-        subject: task.title,
-        body: buildTaskBody(task) || 'Created from Slack',
-        status: mapStatus(task.status),
-        priority: mapPriority(task.priority)
+      properties: {
+        hs_task_subject: task.title,
+        hs_task_body: buildTaskBody(task) || 'Created from Slack',
+        hs_task_status: mapStatus(task.status),
+        hs_task_priority: mapPriority(task.priority),
+        hs_timestamp: taskTimestamp(task),
+        ...(ownerId ? { hubspot_owner_id: ownerId } : {})
       }
     })
   });
