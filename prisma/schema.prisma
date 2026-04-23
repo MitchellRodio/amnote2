@@ -7,31 +7,40 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Task {
-  id                 Int        @id @default(autoincrement())
-  title              String
-  notes              String?
-  dueDate            DateTime?
-  creatorChannelId   String
-  createdBy          String
-  status             TaskStatus @default(OPEN)
-  priority           TaskPriority @default(MEDIUM)
-
-  // 🔥 HubSpot linkage
-  hubspotId          Int?
-
-  createdAt          DateTime   @default(now())
-  updatedAt          DateTime   @updatedAt
-}
-
 enum TaskStatus {
   OPEN
   IN_PROGRESS
   DONE
+  BLOCKED
 }
 
 enum TaskPriority {
   LOW
   MEDIUM
   HIGH
+}
+
+model Task {
+  id                 Int          @id @default(autoincrement())
+  title              String
+  status             TaskStatus   @default(OPEN)
+  priority           TaskPriority @default(MEDIUM)
+  dueDate            DateTime?
+  notes              String?
+  assignedToUserId   String?
+  assignedToName     String?
+  creatorChannelId   String
+  creatorChannelName String?
+  sourceMessageTs    String?
+  sourceMessageLink  String?
+  threadTs           String?
+  contextSnippet     String?
+  createdByUserId    String
+  createdByName      String?
+  hubspotTaskId      String?
+  hubspotCompanyId   String?
+  hubspotCompanyName String?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+  completedAt        DateTime?
 }
