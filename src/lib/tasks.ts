@@ -1,5 +1,6 @@
 import { Task, TaskPriority, TaskStatus } from '@prisma/client';
 import { prisma } from './db';
+import { createHubSpotTask, updateHubSpotTask } from './hubspot';
 
 export type CreateTaskInput = {
   title: string;
@@ -14,10 +15,11 @@ export type CreateTaskInput = {
   threadTs?: string;
   contextSnippet?: string;
   notes?: string;
+  dueDate?: Date | null;
 };
 
 export async function createTask(input: CreateTaskInput): Promise<Task> {
-  return prisma.task.create({
+  const task = await prisma.task.create({
     data: {
       title: input.title,
       creatorChannelId: input.creatorChannelId,
@@ -30,9 +32,28 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
       sourceMessageLink: input.sourceMessageLink,
       threadTs: input.threadTs,
       contextSnippet: input.contextSnippet,
-      notes: input.notes
+      notes: input.notes,
+      dueDate: input.dueDate ?? null
     }
   });
+
+  try {
+    const hubspot = await createHubSpotTask(task);
+    if (hubspot?.hubspotTaskId) {
+      return prisma.task.update({
+        where: { id: task.id },
+        data: {
+          hubspotTaskId: hubspot.hubspotTaskId,
+          hubspotCompanyId: hubspot.hubspotCompanyId,
+          hubspotCompanyName: hubspot.hubspotCompanyName
+        }
+      });
+    }
+  } catch (error) {
+    console.error('HubSpot task create failed', error);
+  }
+
+  return task;
 }
 
 export async function listTasksForUser(userId: string): Promise<Task[]> {
@@ -89,27 +110,51 @@ export async function getTaskById(taskId: number): Promise<Task | null> {
 }
 
 export async function updateTaskStatus(taskId: number, status: TaskStatus): Promise<Task> {
-  return prisma.task.update({
+  const task = await prisma.task.update({
     where: { id: taskId },
     data: {
       status,
       completedAt: status === TaskStatus.DONE ? new Date() : null
     }
   });
+
+  try {
+    await updateHubSpotTask(task);
+  } catch (error) {
+    console.error('HubSpot task status sync failed', error);
+  }
+
+  return task;
 }
 
 export async function updateTaskPriority(taskId: number, priority: TaskPriority): Promise<Task> {
-  return prisma.task.update({
+  const task = await prisma.task.update({
     where: { id: taskId },
     data: { priority }
   });
+
+  try {
+    await updateHubSpotTask(task);
+  } catch (error) {
+    console.error('HubSpot task priority sync failed', error);
+  }
+
+  return task;
 }
 
 export async function updateTaskDueDate(taskId: number, dueDate: Date | null): Promise<Task> {
-  return prisma.task.update({
+  const task = await prisma.task.update({
     where: { id: taskId },
     data: { dueDate }
   });
+
+  try {
+    await updateHubSpotTask(task);
+  } catch (error) {
+    console.error('HubSpot task due date sync failed', error);
+  }
+
+  return task;
 }
 
 export async function taskCountsForToday(userId: string): Promise<{ total: number; overdue: number; high: number }> {

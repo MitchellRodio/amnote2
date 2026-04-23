@@ -71,3 +71,27 @@ Socket Mode means you do **not** need ngrok or a public request URL.
 ## Notes
 - If you change the Prisma schema later, redeploy or run `npx prisma db push` again.
 - After adding a new slash command in Slack, reinstall the Slack app to your workspace.
+
+
+## HubSpot sync
+
+This app can mirror Slack tasks into HubSpot tasks and associate them to the matching company.
+
+### Required Railway variables
+
+- `HUBSPOT_ACCESS_TOKEN`
+- `HUBSPOT_BASE_URL` (leave as `https://api.hubapi.com`)
+- `HUBSPOT_CHANNEL_PREFIXES` (default: `whop-x-,whop-`)
+- `HUBSPOT_COMPANY_OVERRIDES` JSON for edge cases, example: `{"whop-x-toolsuite":"ToolSuite"}`
+
+### Matching logic
+
+For a Slack channel like `whop-x-trust-my-system`, the app strips the prefix, searches HubSpot for variants like `trust-my-system`, `trust my system`, and `Trust My System`, then stores the matched HubSpot company on the local task. Use `HUBSPOT_COMPANY_OVERRIDES` for weird names or exact IDs.
+
+### HubSpot private app scopes
+
+Create a HubSpot private app token with read/write access to companies and tasks. Then add the token to Railway as `HUBSPOT_ACCESS_TOKEN`.
+
+### Important
+
+After pulling this version, run `npx prisma db push` locally if you are testing locally, or redeploy on Railway so Prisma can add the new HubSpot fields to the `Task` table.
