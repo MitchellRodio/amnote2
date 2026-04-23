@@ -7,27 +7,28 @@ function actionsForTask(task: Task): any {
     elements: [
       {
         type: 'button',
-        text: { type: 'plain_text', text: 'Mark Done' },
+        text: { type: 'plain_text', text: '✅ Mark Done' },
         style: 'primary',
         action_id: 'task_mark_done',
         value: String(task.id)
       },
       {
         type: 'button',
-        text: { type: 'plain_text', text: 'Priority' },
+        text: { type: 'plain_text', text: '⚠️ Priority' },
+        style: 'danger',
         action_id: 'task_open_priority_modal',
         value: String(task.id)
       },
       {
         type: 'button',
-        text: { type: 'plain_text', text: 'Due Date' },
+        text: { type: 'plain_text', text: '⏰ Due Date' },
         action_id: 'task_open_due_date_modal',
         value: String(task.id)
       },
       ...(task.sourceMessageLink
         ? [{
             type: 'button',
-            text: { type: 'plain_text', text: 'View Source' },
+            text: { type: 'plain_text', text: '🔗 View Source' },
             url: task.sourceMessageLink,
             action_id: 'task_view_source'
           }]
@@ -102,7 +103,7 @@ export function taskListBlocks(title: string, tasks: Task[]): any[] {
       accessory: {
         type: 'button',
         action_id: 'task_mark_done',
-        text: { type: 'plain_text', text: 'Done' },
+        text: { type: 'plain_text', text: '✅ Done' },
         style: 'primary',
         value: String(task.id)
       }
