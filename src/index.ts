@@ -2,38 +2,29 @@ import { App, LogLevel } from '@slack/bolt';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
-import { TaskPriority, TaskStatus } from '@prisma/client';
 import { env } from './lib/env';
 import { buildCreateTaskModal, buildDueDateModal, buildPriorityModal, buildSlashTodoModal } from './blocks/modals';
 import { singleTaskBlocks, taskListBlocks } from './blocks/taskBlocks';
 import { fetchContextSnippet } from './lib/context';
 import { sanitizeTaskTitle } from './lib/format';
 import {
-  createTask,
-  listOverdueTasks,
-  listTasksForChannel,
-  listTasksForUser,
-  taskCountsForToday,
-  updateTaskDueDate,
-  updateTaskPriority,
-  updateTaskStatus
-} from './lib/tasks';
-import { prisma } from './lib/db';
-import {
-  findCompanyForChannel,
+  HubSpotCompany,
+  HubSpotOwner,
+  createHubSpotTask,
   findHubSpotOwnerByEmail,
   findHubSpotOwnerById,
-  getUserAccountLinkByHubSpotOwnerId,
-  getUserAccountLinkBySlackUserId,
+  findSlackChannelLink,
+  getCompanyById,
   hubSpotOwnerDisplayName,
-  linkSlackUserToHubSpotOwner,
   listHubSpotOwners,
-  setReminderPreferenceForSlackUser,
-  saveChannelLink,
   searchCompanies,
-  updateHubSpotTask
+  searchOpenHubSpotTasks,
+  updateHubSpotTaskDueDate,
+  updateHubSpotTaskPriority,
+  updateHubSpotTaskStatus,
+  upsertSlackChannelLink
 } from './lib/hubspot';
-import { registerReminderJobs } from './lib/reminders';
+import { HubSpotTask, TaskPriority } from './types/domain';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -46,678 +37,394 @@ const app = new App({
   logLevel: env.SLACK_LOG_LEVEL as LogLevel
 });
 
-function taskMeta(params: Record<string, unknown>): string {
-  return JSON.stringify(params);
+function json(value: unknown): string {
+  return JSON.stringify(value);
 }
 
-function taskCreatedEphemeralBlocks(task: any) {
+function taskCreatedEphemeralBlocks(task: HubSpotTask) {
   return [
     ...singleTaskBlocks(task),
-    {
-      type: 'actions',
-      elements: [
-        {
-          type: 'button',
-          text: {
-            type: 'plain_text',
-            text: 'Clear Msg'
-          },
-          action_id: 'clear_ephemeral_message',
-          value: 'clear'
-        }
-      ]
-    }
+    { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Clear Msg' }, action_id: 'clear_ephemeral_message', value: 'clear' }] }
   ];
 }
 
-function listWithClearBlocks(title: string, tasks: any[]) {
+function listWithClearBlocks(title: string, tasks: HubSpotTask[]) {
   return [
     ...taskListBlocks(title, tasks),
-    {
-      type: 'actions',
-      elements: [
-        {
-          type: 'button',
-          text: {
-            type: 'plain_text',
-            text: 'Clear Msg'
-          },
-          action_id: 'clear_ephemeral_message',
-          value: 'clear'
-        }
-      ]
-    }
+    { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Clear Msg' }, action_id: 'clear_ephemeral_message', value: 'clear' }] }
   ];
 }
 
-async function createTaskFromMessage(args: {
+async function slackUserEmail(userId: string): Promise<string | undefined> {
+  const userInfo = await app.client.users.info({ user: userId });
+  const profile = userInfo.user?.profile as { email?: string } | undefined;
+  return profile?.email;
+}
+
+async function defaultOwnerForSlackUser(userId: string): Promise<HubSpotOwner | null> {
+  if (env.HUBSPOT_OWNER_ID) return findHubSpotOwnerById(env.HUBSPOT_OWNER_ID);
+  if (env.HUBSPOT_OWNER_EMAIL) return findHubSpotOwnerByEmail(env.HUBSPOT_OWNER_EMAIL);
+
+  const email = await slackUserEmail(userId).catch(() => undefined);
+  if (!email) return null;
+  return findHubSpotOwnerByEmail(email);
+}
+
+async function selectedOrDefaultOwner(selectedOwnerId: string | undefined, slackUserId: string): Promise<HubSpotOwner | null> {
+  if (selectedOwnerId) return findHubSpotOwnerById(selectedOwnerId);
+  return defaultOwnerForSlackUser(slackUserId);
+}
+
+function parseDueDate(date?: string, hourRaw?: string): Date | undefined {
+  if (!date) return undefined;
+  const parsedHour = hourRaw ? Number(hourRaw) : env.DEFAULT_REMINDER_HOUR;
+  const hour = Number.isFinite(parsedHour) ? Math.min(23, Math.max(0, parsedHour)) : env.DEFAULT_REMINDER_HOUR;
+  return dayjs.tz(`${date} ${String(hour).padStart(2, '0')}:00`, 'YYYY-MM-DD HH:mm', env.TIMEZONE).toDate();
+}
+
+async function createTaskFromInput(args: {
   channelId: string;
   channelName?: string;
   userId: string;
-  userName?: string;
-  text: string;
+  title: string;
+  notes?: string;
+  priority?: TaskPriority;
+  dueDate?: Date;
+  owner?: HubSpotOwner | null;
   sourceTs?: string;
   threadTs?: string;
-  priority?: TaskPriority;
-  notes?: string;
-  dueDate?: Date | null;
-  assignedToUserId?: string;
-  assignedToName?: string;
-  hubspotOwnerId?: string;
-  hubspotOwnerEmail?: string;
-  hubspotOwnerName?: string;
-}) {
-  const title = sanitizeTaskTitle(args.text);
-  if (!title) {
-    throw new Error('Task title is required');
+  contextSnippet?: string;
+}): Promise<HubSpotTask> {
+  const channelLink = await findSlackChannelLink(args.channelId);
+  if (!channelLink?.companyId) {
+    throw new Error('CHANNEL_NOT_LINKED');
+  }
+
+  const owner = args.owner ?? await defaultOwnerForSlackUser(args.userId);
+  if (!owner?.id) {
+    throw new Error('OWNER_NOT_FOUND');
   }
 
   let sourceMessageLink: string | undefined;
-  let contextSnippet: string | undefined;
-
   if (args.sourceTs) {
-    const permalink = await app.client.chat.getPermalink({
-      channel: args.channelId,
-      message_ts: args.sourceTs
-    });
-    sourceMessageLink = permalink.permalink;
-    contextSnippet = await fetchContextSnippet(app, args.channelId, args.threadTs ?? args.sourceTs);
+    const permalink = await app.client.chat.getPermalink({ channel: args.channelId, message_ts: args.sourceTs }).catch(() => null);
+    sourceMessageLink = permalink?.permalink;
   }
 
-  const linkedOwner = args.hubspotOwnerId
-    ? null
-    : await getUserAccountLinkBySlackUserId(args.assignedToUserId ?? args.userId);
+  const contextSnippet = args.contextSnippet ?? (args.threadTs ? await fetchContextSnippet(app, args.channelId, args.threadTs) : undefined);
 
-  return createTask({
-    title,
-    creatorChannelId: args.channelId,
-    creatorChannelName: args.channelName,
-    createdByUserId: args.userId,
-    createdByName: args.userName,
-    assignedToUserId: args.assignedToUserId ?? args.userId,
-    assignedToName: args.assignedToName ?? args.userName,
-    hubspotOwnerId: args.hubspotOwnerId ?? linkedOwner?.hubspotOwnerId,
-    hubspotOwnerEmail: args.hubspotOwnerEmail ?? linkedOwner?.hubspotOwnerEmail ?? undefined,
-    hubspotOwnerName: args.hubspotOwnerName ?? linkedOwner?.hubspotOwnerName ?? undefined,
-    priority: args.priority,
+  return createHubSpotTask({
+    title: sanitizeTaskTitle(args.title),
     notes: args.notes,
+    priority: args.priority ?? 'MEDIUM',
     dueDate: args.dueDate,
-    sourceMessageTs: args.sourceTs,
+    owner,
+    slackChannelId: args.channelId,
+    slackChannelName: args.channelName,
+    slackUserId: args.userId,
     sourceMessageLink,
-    threadTs: args.threadTs,
-    contextSnippet
+    contextSnippet,
+    companyId: channelLink.companyId,
+    companyName: channelLink.companyName
   });
 }
 
-async function sendTaskCreatedDm(
-  task: {
-    id: number;
-    title: string;
-    creatorChannelId: string;
-    sourceMessageLink?: string | null;
-    contextSnippet?: string | null;
-    priority: TaskPriority;
-    status: TaskStatus;
-    dueDate?: Date | null;
-  },
-  userId: string
-) {
-  const dm = await app.client.conversations.open({ users: userId });
-  const channelId = dm.channel?.id;
-  if (!channelId) return;
-
-  await app.client.chat.postMessage({
-    channel: channelId,
-    text: `Task created: ${task.title}`,
-    blocks: [
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `✅ *Task created* in <#${task.creatorChannelId}>`
-        }
-      },
-      ...singleTaskBlocks(task as any)
-    ]
-  });
-}
-
-async function resolveHubSpotOwnerAssignment(ownerId: string | undefined, fallback: {
-  slackUserId: string;
-  slackUserName?: string;
-}) {
-  if (!ownerId) {
-    const linked = await getUserAccountLinkBySlackUserId(fallback.slackUserId);
-    return linked
-      ? {
-          assignedToUserId: fallback.slackUserId,
-          assignedToName: fallback.slackUserName,
-          hubspotOwnerId: linked.hubspotOwnerId,
-          hubspotOwnerEmail: linked.hubspotOwnerEmail ?? undefined,
-          hubspotOwnerName: linked.hubspotOwnerName ?? undefined
-        }
-      : {
-          assignedToUserId: fallback.slackUserId,
-          assignedToName: fallback.slackUserName
-        };
+async function sendTaskCreatedDm(task: HubSpotTask, slackUserId: string) {
+  try {
+    await app.client.chat.postMessage({
+      channel: slackUserId,
+      text: `Created task "${task.title}"`,
+      blocks: singleTaskBlocks(task)
+    });
+  } catch (error) {
+    console.error('Failed to send task DM', error);
   }
+}
 
-  const [owner, linkedUser] = await Promise.all([
-    findHubSpotOwnerById(ownerId),
-    getUserAccountLinkByHubSpotOwnerId(ownerId)
-  ]);
+function companyName(company: HubSpotCompany): string {
+  return company.properties?.name ?? company.properties?.hs_name ?? company.id;
+}
 
-  return {
-    assignedToUserId: linkedUser?.slackUserId ?? fallback.slackUserId,
-    assignedToName: linkedUser?.slackUserName ?? fallback.slackUserName,
-    hubspotOwnerId: ownerId,
-    hubspotOwnerEmail: owner?.email ?? linkedUser?.hubspotOwnerEmail ?? undefined,
-    hubspotOwnerName: owner ? hubSpotOwnerDisplayName(owner) : linkedUser?.hubspotOwnerName ?? undefined
-  };
+function companyDomain(company: HubSpotCompany): string | undefined {
+  return company.properties?.domain;
 }
 
 app.command('/todo', async ({ ack, command, client, respond }) => {
   await ack();
 
-  const initialTitle = sanitizeTaskTitle(command.text);
-  if (!initialTitle) {
-    await respond({
-      response_type: 'ephemeral',
-      text: 'Use `/todo Your task here` inside a creator channel.'
-    });
+  const channelLink = await findSlackChannelLink(command.channel_id);
+  if (!channelLink?.companyId) {
+    await respond({ response_type: 'ephemeral', text: 'This channel is not linked to a HubSpot company. Run `/link` first.' });
     return;
   }
 
-  const metadata = taskMeta({
-    channelId: command.channel_id,
-    channelName: command.channel_name,
-    userId: command.user_id,
-    userName: command.user_name
-  });
-
-  const hubSpotOwners = await listHubSpotOwners();
-
+  const owners = await listHubSpotOwners().catch(() => []);
   await client.views.open({
     trigger_id: command.trigger_id,
-    view: buildSlashTodoModal(metadata, initialTitle, hubSpotOwners)
+    view: buildSlashTodoModal(json({ channelId: command.channel_id, channelName: command.channel_name, userId: command.user_id, userName: command.user_name }), command.text.trim(), owners)
   });
 });
 
 app.command('/link', async ({ ack, command, respond }) => {
   await ack();
-
   const raw = command.text.trim();
   if (!raw) {
-    await respond({
-      response_type: 'ephemeral',
-      text: 'Use `/link <HubSpot company ID or company name>` in the creator channel you want to link.'
-    });
+    await respond({ response_type: 'ephemeral', text: 'Use `/link company name` to link this Slack channel to a HubSpot company.' });
     return;
   }
 
-  let company = null;
-  if (/^\d+$/.test(raw)) {
-    const matched = await findCompanyForChannel({ channelId: undefined, channelName: raw });
-    company = matched;
-    if (!company || company.id !== raw) {
-      const results = await searchCompanies(raw);
-      company = results.find((item) => item.id === raw) ?? null;
-    }
-  } else {
-    const results = await searchCompanies(raw);
-    company = results[0] ?? null;
-  }
+  const matches = /^\d+$/.test(raw)
+    ? [await getCompanyById(raw)].filter((company): company is HubSpotCompany => Boolean(company))
+    : await searchCompanies(raw);
 
-  if (!company?.id) {
-    await respond({
-      response_type: 'ephemeral',
-      text: `Could not find a HubSpot company for "${raw}".`
-    });
+  if (!matches.length) {
+    await respond({ response_type: 'ephemeral', text: `No HubSpot company matches found for "${raw}".` });
     return;
   }
 
-  const companyName = company.properties?.name ?? company.properties?.hs_name ?? company.id;
-  await saveChannelLink({
-    slackChannelId: command.channel_id,
-    slackChannelName: command.channel_name,
-    hubspotCompanyId: company.id,
-    hubspotCompanyName: companyName
-  });
-
   await respond({
     response_type: 'ephemeral',
-    text: `Linked this channel to HubSpot company *${companyName}* (${company.id}).`
-  });
-});
-
-
-app.command('/link-hubspot', async ({ ack, command, respond }) => {
-  await ack();
-
-  const raw = command.text.trim();
-  if (!raw) {
-    await respond({
-      response_type: 'ephemeral',
-      text: 'Use `/link-hubspot your@email.com` to link your Slack account to your HubSpot owner.'
-    });
-    return;
-  }
-
-  const owner = /^\d+$/.test(raw)
-    ? await findHubSpotOwnerById(raw)
-    : await findHubSpotOwnerByEmail(raw);
-
-  if (!owner?.id) {
-    await respond({
-      response_type: 'ephemeral',
-      text: `Could not find a HubSpot owner for "${raw}".`
-    });
-    return;
-  }
-
-  const linked = await linkSlackUserToHubSpotOwner({
-    slackUserId: command.user_id,
-    slackUserName: command.user_name,
-    hubspotOwner: owner
-  });
-
-  await respond({
-    response_type: 'ephemeral',
-    text: `Linked your Slack account to HubSpot owner *${linked.hubspotOwnerName ?? linked.hubspotOwnerEmail ?? linked.hubspotOwnerId}*.`
-  });
-});
-
-app.command('/reminders', async ({ ack, command, respond }) => {
-  await ack();
-
-  const raw = command.text.trim().toLowerCase();
-  if (raw !== 'on' && raw !== 'off') {
-    const linked = await getUserAccountLinkBySlackUserId(command.user_id);
-    const status = linked?.remindersEnabled ? 'on' : 'off';
-    await respond({
-      response_type: 'ephemeral',
-      text: `Use \`/reminders on\` or \`/reminders off\`. Your reminders are currently *${status}*.`
-    });
-    return;
-  }
-
-  const linked = await getUserAccountLinkBySlackUserId(command.user_id);
-  if (!linked) {
-    await respond({
-      response_type: 'ephemeral',
-      text: 'Link your Slack account to your HubSpot owner first with `/link-hubspot your@email.com`, then run `/reminders on`.'
-    });
-    return;
-  }
-
-  const enabled = raw === 'on';
-  const updated = await setReminderPreferenceForSlackUser(command.user_id, enabled);
-  const ownerLabel = updated.hubspotOwnerName ?? updated.hubspotOwnerEmail ?? updated.hubspotOwnerId;
-
-  await respond({
-    response_type: 'ephemeral',
-    text: enabled
-      ? `Reminders are now *on* for tasks assigned to your HubSpot owner, *${ownerLabel}*.`
-      : `Reminders are now *off* for tasks assigned to your HubSpot owner, *${ownerLabel}*.`
-  });
-});
-
-app.command('/mytodos', async ({ ack, command, respond }) => {
-  await ack();
-  const tasks = await listTasksForUser(command.user_id);
-  await respond({
-    response_type: 'ephemeral',
-    blocks: listWithClearBlocks('My Open Tasks', tasks)
-  });
-});
-
-app.command('/list', async ({ ack, command, respond }) => {
-  await ack();
-  const tasks = await listTasksForUser(command.user_id);
-  await respond({
-    response_type: 'ephemeral',
-    blocks: listWithClearBlocks('My Open Tasks', tasks)
-  });
-});
-
-app.command('/todos', async ({ ack, command, respond }) => {
-  await ack();
-  const tasks = await listTasksForChannel(command.channel_id);
-  await respond({
-    response_type: 'ephemeral',
-    blocks: listWithClearBlocks(`Tasks for #${command.channel_name}`, tasks)
-  });
-});
-
-app.command('/overdue', async ({ ack, command, respond }) => {
-  await ack();
-  const tasks = await listOverdueTasks(command.user_id);
-  await respond({
-    response_type: 'ephemeral',
-    blocks: listWithClearBlocks('My Overdue Tasks', tasks)
-  });
-});
-
-app.command('/today', async ({ ack, command, respond }) => {
-  await ack();
-  const [counts, overdue] = await Promise.all([
-    taskCountsForToday(command.user_id),
-    listOverdueTasks(command.user_id)
-  ]);
-
-  const text = `You have ${counts.total} open tasks, ${counts.high} high-priority tasks, and ${counts.overdue} overdue tasks.`;
-  await respond({
-    response_type: 'ephemeral',
-    text,
+    text: 'I found multiple matches. Pick one to confirm.',
     blocks: [
-      {
-        type: 'header',
-        text: { type: 'plain_text', text: 'Your Day' }
-      },
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text }
-      },
-      ...taskListBlocks('Overdue First', overdue).slice(0, 6),
+      { type: 'section', text: { type: 'mrkdwn', text: `*I found these HubSpot companies for:* ${raw}` } },
       {
         type: 'actions',
-        elements: [
-          {
-            type: 'button',
-            text: {
-              type: 'plain_text',
-              text: 'Clear Msg'
-            },
-            action_id: 'clear_ephemeral_message',
-            value: 'clear'
-          }
-        ]
+        elements: matches.slice(0, 3).map((company, index) => ({
+          type: 'button',
+          text: { type: 'plain_text', text: `${index + 1}. ${companyName(company)}${companyDomain(company) ? ` (${companyDomain(company)})` : ''}`.slice(0, 75) },
+          action_id: 'link_company_select',
+          value: json({ channelId: command.channel_id, channelName: command.channel_name, companyId: company.id, companyName: companyName(company) })
+        }))
       }
     ]
   });
 });
 
-app.shortcut('create_task_from_message', async ({ ack, shortcut, client }) => {
+app.action('link_company_select', async ({ ack, action, respond }) => {
   await ack();
-  if (!('message' in shortcut) || !shortcut.message) {
-    return;
-  }
+  if (!('value' in action) || typeof action.value !== 'string') return;
+  const payload = JSON.parse(action.value) as { channelId: string; channelName?: string; companyId: string; companyName: string };
+  const existing = await findSlackChannelLink(payload.channelId);
 
-  const initialTitle = sanitizeTaskTitle(shortcut.message.text || 'Follow up');
-  const metadata = taskMeta({
-    channelId: shortcut.channel.id,
-    channelName: shortcut.channel.name,
-    sourceTs: shortcut.message.ts,
-    threadTs: shortcut.message.thread_ts ?? shortcut.message.ts,
-    userId: shortcut.user.id,
-    userName: shortcut.user.name ?? shortcut.user.username ?? 'Unknown'
-  });
-
-  await client.views.open({
-    trigger_id: shortcut.trigger_id,
-    view: buildCreateTaskModal(metadata, initialTitle)
-  });
-});
-
-app.view('create_task_modal_submit', async ({ ack, body, view, client }) => {
-  await ack();
-  const metadata = JSON.parse(view.private_metadata) as {
-    channelId: string;
-    channelName?: string;
-    sourceTs?: string;
-    threadTs?: string;
-    userId: string;
-    userName?: string;
-  };
-
-  const title = view.state.values.task_title?.value?.value ?? '';
-  const notes = view.state.values.task_notes?.value?.value ?? undefined;
-
-  const task = await createTaskFromMessage({
-    channelId: metadata.channelId,
-    channelName: metadata.channelName,
-    userId: metadata.userId,
-    userName: metadata.userName,
-    text: title,
-    sourceTs: metadata.sourceTs,
-    threadTs: metadata.threadTs
-  });
-
-  if (notes) {
-    const taskWithNotes = await prisma.task.update({ where: { id: task.id }, data: { notes } });
-    try {
-      await updateHubSpotTask(taskWithNotes);
-    } catch (error) {
-      console.error('HubSpot task note sync failed after create task modal submit', error);
-    }
-  }
-
-  const updatedTask = await prisma.task.findUnique({
-    where: { id: task.id }
-  });
-
-  if (!updatedTask) return;
-
-  await client.chat.postEphemeral({
-    channel: metadata.channelId,
-    user: body.user.id,
-    text: `Created task "${updatedTask.title}"`,
-    blocks: taskCreatedEphemeralBlocks(updatedTask)
-  });
-
-  await sendTaskCreatedDm(updatedTask as any, updatedTask.assignedToUserId ?? body.user.id);
-});
-
-app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
-  await ack();
-
-  const metadata = JSON.parse(view.private_metadata) as {
-    channelId: string;
-    channelName?: string;
-    userId: string;
-    userName?: string;
-  };
-
-  const title = sanitizeTaskTitle(view.state.values.task_title?.value?.value ?? '');
-  const notes = view.state.values.task_notes?.value?.value ?? undefined;
-  const priority =
-    (view.state.values.priority?.value?.selected_option?.value as TaskPriority | undefined) ??
-    TaskPriority.MEDIUM;
-  const hubspotOwnerId = view.state.values.hubspot_owner?.value?.selected_option?.value as string | undefined;
-
-  const date = view.state.values.due_date?.value?.selected_date;
-  const hourRaw = view.state.values.due_time?.value?.value;
-  const parsedHour = hourRaw ? Number(hourRaw) : env.DEFAULT_REMINDER_HOUR;
-  const hour = Number.isFinite(parsedHour)
-    ? Math.min(23, Math.max(0, parsedHour))
-    : env.DEFAULT_REMINDER_HOUR;
-
-  const dueDate = date
-    ? dayjs.tz(
-        `${date} ${String(hour).padStart(2, '0')}:00`,
-        'YYYY-MM-DD HH:mm',
-        env.TIMEZONE
-      ).toDate()
-    : undefined;
-
-  if (!title) {
-    await client.chat.postEphemeral({
-      channel: metadata.channelId,
-      user: body.user.id,
-      text: 'Task title is required.'
+  if (existing?.companyId && existing.companyId !== payload.companyId) {
+    await respond({
+      replace_original: true,
+      response_type: 'ephemeral',
+      text: `This channel is already linked to ${existing.companyName ?? existing.companyId}. Replace it?`,
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: `This channel is already linked to *${existing.companyName ?? existing.companyId}*. Replace it with *${payload.companyName}*?` } },
+        { type: 'actions', elements: [
+          { type: 'button', text: { type: 'plain_text', text: 'Replace link' }, style: 'danger', action_id: 'link_company_replace_confirm', value: action.value },
+          { type: 'button', text: { type: 'plain_text', text: 'Cancel' }, action_id: 'clear_ephemeral_message', value: 'clear' }
+        ] }
+      ]
     });
     return;
   }
 
-  const assignment = await resolveHubSpotOwnerAssignment(hubspotOwnerId, {
-    slackUserId: metadata.userId,
-    slackUserName: metadata.userName
+  await upsertSlackChannelLink({ channelId: payload.channelId, channelName: payload.channelName, companyId: payload.companyId, companyName: payload.companyName });
+  await respond({ replace_original: true, response_type: 'ephemeral', text: `Linked this channel to HubSpot company *${payload.companyName}* (${payload.companyId}).` });
+});
+
+app.action('link_company_replace_confirm', async ({ ack, action, respond }) => {
+  await ack();
+  if (!('value' in action) || typeof action.value !== 'string') return;
+  const payload = JSON.parse(action.value) as { channelId: string; channelName?: string; companyId: string; companyName: string };
+  await upsertSlackChannelLink({ channelId: payload.channelId, channelName: payload.channelName, companyId: payload.companyId, companyName: payload.companyName });
+  await respond({ replace_original: true, response_type: 'ephemeral', text: `Re-linked this channel to HubSpot company *${payload.companyName}* (${payload.companyId}).` });
+});
+
+app.command('/list', async ({ ack, command, respond }) => {
+  await ack();
+  const owner = await defaultOwnerForSlackUser(command.user_id);
+  if (!owner?.id) {
+    await respond({ response_type: 'ephemeral', text: 'Could not match your Slack email to a HubSpot owner. Make sure Slack email access is enabled or select an owner when creating tasks.' });
+    return;
+  }
+  const tasks = await searchOpenHubSpotTasks({ ownerId: owner.id });
+  await respond({ response_type: 'ephemeral', blocks: listWithClearBlocks('My Open Tasks', tasks) });
+});
+
+app.command('/mytodos', async ({ ack, command, respond }) => {
+  await ack();
+  const owner = await defaultOwnerForSlackUser(command.user_id);
+  if (!owner?.id) {
+    await respond({ response_type: 'ephemeral', text: 'Could not match your Slack email to a HubSpot owner.' });
+    return;
+  }
+  const tasks = await searchOpenHubSpotTasks({ ownerId: owner.id });
+  await respond({ response_type: 'ephemeral', blocks: listWithClearBlocks('My Open Tasks', tasks) });
+});
+
+app.command('/todos', async ({ ack, command, respond }) => {
+  await ack();
+  const owner = await defaultOwnerForSlackUser(command.user_id);
+  if (!owner?.id) {
+    await respond({ response_type: 'ephemeral', text: 'Could not match your Slack email to a HubSpot owner.' });
+    return;
+  }
+  const tasks = await searchOpenHubSpotTasks({ ownerId: owner.id, slackChannelId: command.channel_id });
+  await respond({ response_type: 'ephemeral', blocks: listWithClearBlocks(`Tasks for #${command.channel_name}`, tasks) });
+});
+
+app.shortcut('create_task_from_message', async ({ ack, shortcut, client }) => {
+  await ack();
+  if (!('message' in shortcut) || !shortcut.message) return;
+
+  const channelId = shortcut.channel.id;
+  const channelLink = await findSlackChannelLink(channelId);
+  if (!channelLink?.companyId) {
+    await client.chat.postEphemeral({ channel: channelId, user: shortcut.user.id, text: 'This channel is not linked to a HubSpot company. Run `/link` first.' });
+    return;
+  }
+
+  const owners = await listHubSpotOwners().catch(() => []);
+  await client.views.open({
+    trigger_id: shortcut.trigger_id,
+    view: buildCreateTaskModal(json({
+      channelId,
+      channelName: shortcut.channel.name,
+      sourceTs: shortcut.message.ts,
+      threadTs: shortcut.message.thread_ts ?? shortcut.message.ts,
+      userId: shortcut.user.id,
+      userName: shortcut.user.name ?? shortcut.user.username ?? 'Unknown'
+    }), sanitizeTaskTitle(shortcut.message.text || 'Follow up'), owners)
   });
+});
 
-  const updatedTask = await createTaskFromMessage({
-    channelId: metadata.channelId,
-    channelName: metadata.channelName,
-    userId: metadata.userId,
-    userName: metadata.userName,
-    text: title,
-    notes,
-    priority,
-    dueDate,
-    ...assignment
-  });
+async function handleTaskModalSubmit(body: any, view: any, client: any, metadata: any) {
+  const title = sanitizeTaskTitle(view.state.values.task_title?.value?.value ?? '');
+  const notes = view.state.values.task_notes?.value?.value ?? undefined;
+  const priority = (view.state.values.priority?.value?.selected_option?.value as TaskPriority | undefined) ?? 'MEDIUM';
+  const hubspotOwnerId = view.state.values.hubspot_owner?.value?.selected_option?.value as string | undefined;
+  const dueDate = parseDueDate(view.state.values.due_date?.value?.selected_date, view.state.values.due_time?.value?.value);
 
-  if (!updatedTask) return;
+  if (!title) {
+    await client.chat.postEphemeral({ channel: metadata.channelId, user: body.user.id, text: 'Task title is required.' });
+    return;
+  }
 
-  await client.chat.postEphemeral({
-    channel: metadata.channelId,
-    user: body.user.id,
-    text: `Created task "${updatedTask.title}"`,
-    blocks: taskCreatedEphemeralBlocks(updatedTask)
-  });
+  const owner = await selectedOrDefaultOwner(hubspotOwnerId, metadata.userId);
+  if (!owner?.id) {
+    await client.chat.postEphemeral({ channel: metadata.channelId, user: body.user.id, text: 'Could not match your Slack email to a HubSpot owner. Pick an owner from the dropdown or enable Slack email access.' });
+    return;
+  }
 
-  await sendTaskCreatedDm(updatedTask as any, updatedTask.assignedToUserId ?? body.user.id);
+  try {
+    const task = await createTaskFromInput({
+      channelId: metadata.channelId,
+      channelName: metadata.channelName,
+      userId: metadata.userId,
+      title,
+      notes,
+      priority,
+      dueDate,
+      owner,
+      sourceTs: metadata.sourceTs,
+      threadTs: metadata.threadTs
+    });
+
+    await client.chat.postEphemeral({ channel: metadata.channelId, user: body.user.id, text: `Created task "${task.title}"`, blocks: taskCreatedEphemeralBlocks(task) });
+    await sendTaskCreatedDm(task, metadata.userId);
+  } catch (error) {
+    const text = error instanceof Error && error.message === 'CHANNEL_NOT_LINKED'
+      ? 'This channel is not linked to a HubSpot company. Run `/link` first.'
+      : `Could not create task: ${error instanceof Error ? error.message : 'Unknown error'}`;
+    await client.chat.postEphemeral({ channel: metadata.channelId, user: body.user.id, text });
+  }
+}
+
+app.view('create_task_modal_submit', async ({ ack, body, view, client }) => {
+  await ack();
+  await handleTaskModalSubmit(body, view, client, JSON.parse(view.private_metadata));
+});
+
+app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
+  await ack();
+  await handleTaskModalSubmit(body, view, client, JSON.parse(view.private_metadata));
 });
 
 app.event('reaction_added', async ({ event }) => {
-  if (event.reaction !== env.TODO_REACTION) {
-    return;
-  }
-
-  if (event.item.type !== 'message') {
-    return;
-  }
+  if (event.reaction !== env.TODO_REACTION || event.item.type !== 'message') return;
 
   const channelId = event.item.channel;
   const sourceTs = event.item.ts;
-
-  const history = await app.client.conversations.history({
-    channel: channelId,
-    latest: sourceTs,
-    inclusive: true,
-    limit: 1
-  });
-
+  const history = await app.client.conversations.history({ channel: channelId, latest: sourceTs, inclusive: true, limit: 1 });
   const message = history.messages?.[0];
-  if (!message || !('text' in message) || !message.text) {
-    return;
+  if (!message || !('text' in message) || !message.text) return;
+
+  const channel = await app.client.conversations.info({ channel: channelId }).catch(() => null);
+  const channelName = channel?.channel && 'name' in channel.channel ? channel.channel.name : undefined;
+
+  try {
+    const task = await createTaskFromInput({
+      channelId,
+      channelName,
+      userId: event.user,
+      title: message.text,
+      sourceTs,
+      threadTs: ('thread_ts' in message && typeof message.thread_ts === 'string') ? message.thread_ts : sourceTs
+    });
+
+    await app.client.chat.postEphemeral({ channel: channelId, user: event.user, text: `Created task "${task.title}" from reaction`, blocks: taskCreatedEphemeralBlocks(task) });
+  } catch (error) {
+    console.error('Reaction task create failed', error);
   }
-
-  const existing = await prisma.task.findFirst({
-    where: {
-      creatorChannelId: channelId,
-      sourceMessageTs: sourceTs,
-      createdByUserId: event.user
-    }
-  });
-
-  if (existing) {
-    return;
-  }
-
-  const task = await createTaskFromMessage({
-    channelId,
-    userId: event.user,
-    text: message.text,
-    sourceTs,
-    threadTs: ('thread_ts' in message && typeof message.thread_ts === 'string') ? message.thread_ts : sourceTs
-  });
-
-  await app.client.chat.postEphemeral({
-    channel: channelId,
-    user: event.user,
-    text: `Created task "${task.title}" from reaction`,
-    blocks: taskCreatedEphemeralBlocks(task)
-  });
 });
 
 app.action('task_mark_done', async ({ ack, body, action, client }) => {
   await ack();
-  const taskId = Number('value' in action && typeof action.value === 'string' ? action.value : '0');
-  const task = await updateTaskStatus(taskId, TaskStatus.DONE);
-  const channel = ('channel' in body && body.channel?.id) ? body.channel.id : task.creatorChannelId;
-  const userId = body.user.id;
-
-  await client.chat.postEphemeral({
-    channel,
-    user: userId,
-    text: `✅ Task "${task.title}" marked as done`
-  });
+  const taskId = 'value' in action && typeof action.value === 'string' ? action.value : '';
+  if (!taskId) return;
+  const task = await updateHubSpotTaskStatus(taskId, true);
+  const channel = ('channel' in body && body.channel?.id) ? body.channel.id : task.slackChannelId;
+  if (!channel) return;
+  await client.chat.postEphemeral({ channel, user: body.user.id, text: `✅ Task "${task.title}" marked as done` });
 });
 
 app.action('clear_ephemeral_message', async ({ ack, respond }) => {
   await ack();
-  await respond({
-    delete_original: true
-  });
+  await respond({ delete_original: true });
 });
 
 app.action('task_open_priority_modal', async ({ ack, body, action, client }) => {
   await ack();
   if (!('trigger_id' in body) || typeof body.trigger_id !== 'string') return;
-  const taskId = Number('value' in action && typeof action.value === 'string' ? action.value : '0');
-  await client.views.open({
-    trigger_id: body.trigger_id,
-    view: buildPriorityModal(taskId)
-  });
+  const taskId = 'value' in action && typeof action.value === 'string' ? action.value : '';
+  await client.views.open({ trigger_id: body.trigger_id, view: buildPriorityModal(taskId) });
 });
 
 app.action('task_open_due_date_modal', async ({ ack, body, action, client }) => {
   await ack();
   if (!('trigger_id' in body) || typeof body.trigger_id !== 'string') return;
-  const taskId = Number('value' in action && typeof action.value === 'string' ? action.value : '0');
-  await client.views.open({
-    trigger_id: body.trigger_id,
-    view: buildDueDateModal(taskId)
-  });
+  const taskId = 'value' in action && typeof action.value === 'string' ? action.value : '';
+  await client.views.open({ trigger_id: body.trigger_id, view: buildDueDateModal(taskId) });
 });
 
 app.view('task_priority_modal_submit', async ({ ack, view, body, client }) => {
   await ack();
-  const { taskId } = JSON.parse(view.private_metadata) as { taskId: number };
+  const { taskId } = JSON.parse(view.private_metadata) as { taskId: string };
   const priority = view.state.values.priority.value.selected_option?.value as TaskPriority;
-  const task = await updateTaskPriority(taskId, priority);
-  await client.chat.postEphemeral({
-    channel: task.creatorChannelId,
-    user: body.user.id,
-    text: `Updated task "${task.title}" priority to ${task.priority}.`,
-    blocks: singleTaskBlocks(task)
-  });
+  const task = await updateHubSpotTaskPriority(taskId, priority);
+  if (!task.slackChannelId) return;
+  await client.chat.postEphemeral({ channel: task.slackChannelId, user: body.user.id, text: `Updated task "${task.title}" priority to ${task.priority}.`, blocks: singleTaskBlocks(task) });
 });
 
 app.view('task_due_date_modal_submit', async ({ ack, view, body, client }) => {
   await ack();
-  const { taskId } = JSON.parse(view.private_metadata) as { taskId: number };
-  const date = view.state.values.due_date.value.selected_date;
-  const hourRaw = view.state.values.due_time?.value?.value;
-  const parsedHour = hourRaw ? Number(hourRaw) : env.DEFAULT_REMINDER_HOUR;
-  const hour = Number.isFinite(parsedHour)
-    ? Math.min(23, Math.max(0, parsedHour))
-    : env.DEFAULT_REMINDER_HOUR;
-  const due = date
-    ? dayjs.tz(`${date} ${String(hour).padStart(2, '0')}:00`, 'YYYY-MM-DD HH:mm', env.TIMEZONE).toDate()
-    : null;
-  const task = await updateTaskDueDate(taskId, due);
-  await client.chat.postEphemeral({
-    channel: task.creatorChannelId,
-    user: body.user.id,
-    text: `Updated due date for "${task.title}".`,
-    blocks: singleTaskBlocks(task)
-  });
+  const { taskId } = JSON.parse(view.private_metadata) as { taskId: string };
+  const due = parseDueDate(view.state.values.due_date.value.selected_date, view.state.values.due_time?.value?.value) ?? null;
+  const task = await updateHubSpotTaskDueDate(taskId, due);
+  if (!task.slackChannelId) return;
+  await client.chat.postEphemeral({ channel: task.slackChannelId, user: body.user.id, text: `Updated due date for "${task.title}".`, blocks: singleTaskBlocks(task) });
 });
 
 async function start() {
-  registerReminderJobs(app);
   await app.start();
-  console.log('⚡️ Creator Tasks Slack app is running');
+  console.log('⚡️ Creator Tasks Slack app is running stateless');
 }
 
-process.on('SIGINT', async () => {
-  await prisma.$disconnect();
-  process.exit(0);
-});
-
-start().catch(async (error) => {
+start().catch((error) => {
   console.error(error);
-  await prisma.$disconnect();
   process.exit(1);
 });

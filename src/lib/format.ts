@@ -1,14 +1,14 @@
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
-import { TaskPriority, TaskStatus } from '@prisma/client';
 import { env } from './env';
+import { TaskPriority, TaskStatus } from '../types/domain';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
 export function humanizeStatus(status: TaskStatus): string {
-  return status.replace('_', ' ').toLowerCase().replace(/\b\w/g, (char) => char.toUpperCase());
+  return status === 'DONE' ? 'Done' : 'Open';
 }
 
 export function humanizePriority(priority: TaskPriority): string {
@@ -16,10 +16,7 @@ export function humanizePriority(priority: TaskPriority): string {
 }
 
 export function formatDueDate(date?: Date | null): string {
-  if (!date) {
-    return 'None';
-  }
-
+  if (!date) return 'None';
   return dayjs(date).tz(env.TIMEZONE).format('MMM D, YYYY h:mm A z');
 }
 
