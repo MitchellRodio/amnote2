@@ -17,6 +17,10 @@ export type CreateTaskInput = {
   createdByName?: string;
   assignedToUserId?: string;
   assignedToName?: string;
+  hubspotOwnerId?: string;
+  hubspotOwnerEmail?: string;
+  hubspotOwnerName?: string;
+  priority?: TaskPriority;
   sourceMessageTs?: string;
   sourceMessageLink?: string;
   threadTs?: string;
@@ -35,6 +39,10 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
       createdByName: input.createdByName,
       assignedToUserId: input.assignedToUserId ?? input.createdByUserId,
       assignedToName: input.assignedToName ?? input.createdByName,
+      hubspotOwnerId: input.hubspotOwnerId,
+      hubspotOwnerEmail: input.hubspotOwnerEmail,
+      hubspotOwnerName: input.hubspotOwnerName,
+      priority: input.priority ?? TaskPriority.MEDIUM,
       sourceMessageTs: input.sourceMessageTs,
       sourceMessageLink: input.sourceMessageLink,
       threadTs: input.threadTs,

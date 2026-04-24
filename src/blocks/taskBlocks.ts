@@ -52,6 +52,13 @@ export function singleTaskBlocks(task: Task): any[] {
     });
   }
 
+  if (task.hubspotOwnerName || task.hubspotOwnerEmail || task.hubspotOwnerId) {
+    fields.push({
+      type: 'mrkdwn',
+      text: `*HubSpot Owner*\n${task.hubspotOwnerName ?? task.hubspotOwnerEmail ?? task.hubspotOwnerId}`
+    });
+  }
+
   const blocks: any[] = [
     {
       type: 'header',
@@ -94,11 +101,12 @@ export function taskListBlocks(title: string, tasks: Task[]): any[] {
 
   for (const task of tasks.slice(0, 20)) {
     const companyLine = task.hubspotCompanyName ? `\n• HubSpot: ${task.hubspotCompanyName}` : '';
+    const ownerLine = task.hubspotOwnerName || task.hubspotOwnerEmail ? `\n• Owner: ${task.hubspotOwnerName ?? task.hubspotOwnerEmail}` : '';
     blocks.push({
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*Task* ${task.title}\n• ${humanizePriority(task.priority)} priority\n• Due: ${formatDueDate(task.dueDate)}\n• Creator: <#${task.creatorChannelId}>${companyLine}${task.sourceMessageLink ? `\n• <${task.sourceMessageLink}|Open source message>` : ''}`
+        text: `*Task* ${task.title}\n• ${humanizePriority(task.priority)} priority\n• Due: ${formatDueDate(task.dueDate)}\n• Creator: <#${task.creatorChannelId}>${companyLine}${ownerLine}${task.sourceMessageLink ? `\n• <${task.sourceMessageLink}|Open source message>` : ''}`
       },
       accessory: {
         type: 'button',

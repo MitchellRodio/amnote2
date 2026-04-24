@@ -51,6 +51,12 @@
         "description": "Link the current creator channel to a HubSpot company",
         "usage_hint": "/link ToolSuite or /link 123456",
         "should_escape": false
+      },
+      {
+        "command": "/link-hubspot",
+        "description": "Link your Slack account to your HubSpot owner",
+        "usage_hint": "/link-hubspot your@email.com",
+        "should_escape": false
       }
     ],
     "shortcuts": [

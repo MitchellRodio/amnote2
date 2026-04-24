@@ -19,7 +19,19 @@ import {
   updateTaskStatus
 } from './lib/tasks';
 import { prisma } from './lib/db';
-import { findCompanyForChannel, saveChannelLink, searchCompanies, updateHubSpotTask } from './lib/hubspot';
+import {
+  findCompanyForChannel,
+  findHubSpotOwnerByEmail,
+  findHubSpotOwnerById,
+  getUserAccountLinkByHubSpotOwnerId,
+  getUserAccountLinkBySlackUserId,
+  hubSpotOwnerDisplayName,
+  linkSlackUserToHubSpotOwner,
+  listHubSpotOwners,
+  saveChannelLink,
+  searchCompanies,
+  updateHubSpotTask
+} from './lib/hubspot';
 import { registerReminderJobs } from './lib/reminders';
 
 dayjs.extend(utc);
@@ -85,6 +97,14 @@ async function createTaskFromMessage(args: {
   text: string;
   sourceTs?: string;
   threadTs?: string;
+  priority?: TaskPriority;
+  notes?: string;
+  dueDate?: Date | null;
+  assignedToUserId?: string;
+  assignedToName?: string;
+  hubspotOwnerId?: string;
+  hubspotOwnerEmail?: string;
+  hubspotOwnerName?: string;
 }) {
   const title = sanitizeTaskTitle(args.text);
   if (!title) {
@@ -103,14 +123,24 @@ async function createTaskFromMessage(args: {
     contextSnippet = await fetchContextSnippet(app, args.channelId, args.threadTs ?? args.sourceTs);
   }
 
+  const linkedOwner = args.hubspotOwnerId
+    ? null
+    : await getUserAccountLinkBySlackUserId(args.assignedToUserId ?? args.userId);
+
   return createTask({
     title,
     creatorChannelId: args.channelId,
     creatorChannelName: args.channelName,
     createdByUserId: args.userId,
     createdByName: args.userName,
-    assignedToUserId: args.userId,
-    assignedToName: args.userName,
+    assignedToUserId: args.assignedToUserId ?? args.userId,
+    assignedToName: args.assignedToName ?? args.userName,
+    hubspotOwnerId: args.hubspotOwnerId ?? linkedOwner?.hubspotOwnerId,
+    hubspotOwnerEmail: args.hubspotOwnerEmail ?? linkedOwner?.hubspotOwnerEmail ?? undefined,
+    hubspotOwnerName: args.hubspotOwnerName ?? linkedOwner?.hubspotOwnerName ?? undefined,
+    priority: args.priority,
+    notes: args.notes,
+    dueDate: args.dueDate,
     sourceMessageTs: args.sourceTs,
     sourceMessageLink,
     threadTs: args.threadTs,
@@ -151,6 +181,40 @@ async function sendTaskCreatedDm(
   });
 }
 
+async function resolveHubSpotOwnerAssignment(ownerId: string | undefined, fallback: {
+  slackUserId: string;
+  slackUserName?: string;
+}) {
+  if (!ownerId) {
+    const linked = await getUserAccountLinkBySlackUserId(fallback.slackUserId);
+    return linked
+      ? {
+          assignedToUserId: fallback.slackUserId,
+          assignedToName: fallback.slackUserName,
+          hubspotOwnerId: linked.hubspotOwnerId,
+          hubspotOwnerEmail: linked.hubspotOwnerEmail ?? undefined,
+          hubspotOwnerName: linked.hubspotOwnerName ?? undefined
+        }
+      : {
+          assignedToUserId: fallback.slackUserId,
+          assignedToName: fallback.slackUserName
+        };
+  }
+
+  const [owner, linkedUser] = await Promise.all([
+    findHubSpotOwnerById(ownerId),
+    getUserAccountLinkByHubSpotOwnerId(ownerId)
+  ]);
+
+  return {
+    assignedToUserId: linkedUser?.slackUserId ?? fallback.slackUserId,
+    assignedToName: linkedUser?.slackUserName ?? fallback.slackUserName,
+    hubspotOwnerId: ownerId,
+    hubspotOwnerEmail: owner?.email ?? linkedUser?.hubspotOwnerEmail ?? undefined,
+    hubspotOwnerName: owner ? hubSpotOwnerDisplayName(owner) : linkedUser?.hubspotOwnerName ?? undefined
+  };
+}
+
 app.command('/todo', async ({ ack, command, client, respond }) => {
   await ack();
 
@@ -170,9 +234,11 @@ app.command('/todo', async ({ ack, command, client, respond }) => {
     userName: command.user_name
   });
 
+  const hubSpotOwners = await listHubSpotOwners();
+
   await client.views.open({
     trigger_id: command.trigger_id,
-    view: buildSlashTodoModal(metadata, initialTitle)
+    view: buildSlashTodoModal(metadata, initialTitle, hubSpotOwners)
   });
 });
 
@@ -220,6 +286,43 @@ app.command('/link', async ({ ack, command, respond }) => {
   await respond({
     response_type: 'ephemeral',
     text: `Linked this channel to HubSpot company *${companyName}* (${company.id}).`
+  });
+});
+
+
+app.command('/link-hubspot', async ({ ack, command, respond }) => {
+  await ack();
+
+  const raw = command.text.trim();
+  if (!raw) {
+    await respond({
+      response_type: 'ephemeral',
+      text: 'Use `/link-hubspot your@email.com` to link your Slack account to your HubSpot owner.'
+    });
+    return;
+  }
+
+  const owner = /^\d+$/.test(raw)
+    ? await findHubSpotOwnerById(raw)
+    : await findHubSpotOwnerByEmail(raw);
+
+  if (!owner?.id) {
+    await respond({
+      response_type: 'ephemeral',
+      text: `Could not find a HubSpot owner for "${raw}".`
+    });
+    return;
+  }
+
+  const linked = await linkSlackUserToHubSpotOwner({
+    slackUserId: command.user_id,
+    slackUserName: command.user_name,
+    hubspotOwner: owner
+  });
+
+  await respond({
+    response_type: 'ephemeral',
+    text: `Linked your Slack account to HubSpot owner *${linked.hubspotOwnerName ?? linked.hubspotOwnerEmail ?? linked.hubspotOwnerId}*.`
   });
 });
 
@@ -345,7 +448,12 @@ app.view('create_task_modal_submit', async ({ ack, body, view, client }) => {
   });
 
   if (notes) {
-    await prisma.task.update({ where: { id: task.id }, data: { notes } });
+    const taskWithNotes = await prisma.task.update({ where: { id: task.id }, data: { notes } });
+    try {
+      await updateHubSpotTask(taskWithNotes);
+    } catch (error) {
+      console.error('HubSpot task note sync failed after create task modal submit', error);
+    }
   }
 
   const updatedTask = await prisma.task.findUnique({
@@ -361,7 +469,7 @@ app.view('create_task_modal_submit', async ({ ack, body, view, client }) => {
     blocks: taskCreatedEphemeralBlocks(updatedTask)
   });
 
-  await sendTaskCreatedDm(updatedTask as any, body.user.id);
+  await sendTaskCreatedDm(updatedTask as any, updatedTask.assignedToUserId ?? body.user.id);
 });
 
 app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
@@ -379,6 +487,7 @@ app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
   const priority =
     (view.state.values.priority?.value?.selected_option?.value as TaskPriority | undefined) ??
     TaskPriority.MEDIUM;
+  const hubspotOwnerId = view.state.values.hubspot_owner?.value?.selected_option?.value as string | undefined;
 
   const date = view.state.values.due_date?.value?.selected_date;
   const hourRaw = view.state.values.due_time?.value?.value;
@@ -404,28 +513,22 @@ app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
     return;
   }
 
-  const task = await createTaskFromMessage({
+  const assignment = await resolveHubSpotOwnerAssignment(hubspotOwnerId, {
+    slackUserId: metadata.userId,
+    slackUserName: metadata.userName
+  });
+
+  const updatedTask = await createTaskFromMessage({
     channelId: metadata.channelId,
     channelName: metadata.channelName,
     userId: metadata.userId,
     userName: metadata.userName,
-    text: title
+    text: title,
+    notes,
+    priority,
+    dueDate,
+    ...assignment
   });
-
-  const updatedTask = await prisma.task.update({
-    where: { id: task.id },
-    data: {
-      notes,
-      priority,
-      dueDate
-    }
-  });
-
-  try {
-    await updateHubSpotTask(updatedTask);
-  } catch (error) {
-    console.error('HubSpot task sync failed after slash modal submit', error);
-  }
 
   if (!updatedTask) return;
 
@@ -436,7 +539,7 @@ app.view('slash_todo_modal_submit', async ({ ack, body, view, client }) => {
     blocks: taskCreatedEphemeralBlocks(updatedTask)
   });
 
-  await sendTaskCreatedDm(updatedTask as any, body.user.id);
+  await sendTaskCreatedDm(updatedTask as any, updatedTask.assignedToUserId ?? body.user.id);
 });
 
 app.event('reaction_added', async ({ event }) => {

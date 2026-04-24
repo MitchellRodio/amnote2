@@ -29,6 +29,9 @@ model Task {
   notes              String?
   assignedToUserId   String?
   assignedToName     String?
+  hubspotOwnerId     String?
+  hubspotOwnerEmail  String?
+  hubspotOwnerName   String?
   creatorChannelId   String
   creatorChannelName String?
   sourceMessageTs    String?
@@ -53,4 +56,15 @@ model ChannelLink {
   hubspotCompanyName String?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
+}
+
+model UserAccountLink {
+  id               Int      @id @default(autoincrement())
+  slackUserId      String   @unique
+  slackUserName    String?
+  hubspotOwnerId   String   @unique
+  hubspotOwnerEmail String?
+  hubspotOwnerName  String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 }

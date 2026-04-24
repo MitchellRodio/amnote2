@@ -10,13 +10,18 @@ type HubSpotCompany = {
   };
 };
 
-type HubSpotOwner = {
+export type HubSpotOwner = {
   id: string;
   email?: string;
   firstName?: string;
   lastName?: string;
   archived?: boolean;
 };
+
+export function hubSpotOwnerDisplayName(owner: HubSpotOwner): string {
+  const name = [owner.firstName, owner.lastName].filter(Boolean).join(' ').trim();
+  return name || owner.email || `HubSpot owner ${owner.id}`;
+}
 
 function enabled(): boolean {
   return Boolean(env.HUBSPOT_ACCESS_TOKEN);
@@ -283,8 +288,96 @@ function buildTaskBody(task: Task): string {
     task.notes,
     task.contextSnippet ? `Context: ${task.contextSnippet}` : undefined,
     task.sourceMessageLink ? `Slack source: ${task.sourceMessageLink}` : undefined,
-    task.creatorChannelName ? `Slack channel: #${task.creatorChannelName}` : undefined
+    task.creatorChannelName ? `Slack channel: #${task.creatorChannelName}` : undefined,
+    task.hubspotOwnerName || task.hubspotOwnerEmail ? `Assigned HubSpot owner: ${task.hubspotOwnerName ?? task.hubspotOwnerEmail}` : undefined
   ].filter(Boolean).join('\n\n');
+}
+
+
+let ownersCache: { fetchedAt: number; owners: HubSpotOwner[] } | null = null;
+
+export async function listHubSpotOwners(): Promise<HubSpotOwner[]> {
+  if (!enabled()) return [];
+
+  const now = Date.now();
+  if (ownersCache && now - ownersCache.fetchedAt < 5 * 60 * 1000) {
+    return ownersCache.owners;
+  }
+
+  const result = await hubspotFetch<{ results: HubSpotOwner[] }>(`/crm/v3/owners`, { method: 'GET' });
+  const owners = (result.results ?? [])
+    .filter((owner) => !owner.archived)
+    .sort((a, b) => hubSpotOwnerDisplayName(a).localeCompare(hubSpotOwnerDisplayName(b)));
+
+  ownersCache = { fetchedAt: now, owners };
+  return owners;
+}
+
+export async function findHubSpotOwnerByEmail(email: string): Promise<HubSpotOwner | null> {
+  const target = email.trim().toLowerCase();
+  if (!target) return null;
+
+  const owners = await listHubSpotOwners();
+  return owners.find((owner) => (owner.email ?? '').toLowerCase() === target) ?? null;
+}
+
+export async function findHubSpotOwnerById(ownerId?: string | null): Promise<HubSpotOwner | null> {
+  if (!ownerId) return null;
+  const owners = await listHubSpotOwners();
+  return owners.find((owner) => owner.id === ownerId) ?? null;
+}
+
+export async function linkSlackUserToHubSpotOwner(args: {
+  slackUserId: string;
+  slackUserName?: string | null;
+  hubspotOwner: HubSpotOwner;
+}) {
+  const ownerName = hubSpotOwnerDisplayName(args.hubspotOwner);
+
+  return prisma.$transaction(async (tx) => {
+    await tx.userAccountLink.deleteMany({
+      where: {
+        hubspotOwnerId: args.hubspotOwner.id,
+        slackUserId: { not: args.slackUserId }
+      }
+    });
+
+    return tx.userAccountLink.upsert({
+      where: { slackUserId: args.slackUserId },
+      update: {
+        slackUserName: args.slackUserName ?? undefined,
+        hubspotOwnerId: args.hubspotOwner.id,
+        hubspotOwnerEmail: args.hubspotOwner.email ?? undefined,
+        hubspotOwnerName: ownerName
+      },
+      create: {
+        slackUserId: args.slackUserId,
+        slackUserName: args.slackUserName ?? undefined,
+        hubspotOwnerId: args.hubspotOwner.id,
+        hubspotOwnerEmail: args.hubspotOwner.email ?? undefined,
+        hubspotOwnerName: ownerName
+      }
+    });
+  });
+}
+
+export async function getUserAccountLinkBySlackUserId(slackUserId?: string | null) {
+  if (!slackUserId) return null;
+  return prisma.userAccountLink.findUnique({ where: { slackUserId } });
+}
+
+export async function getUserAccountLinkByHubSpotOwnerId(hubspotOwnerId?: string | null) {
+  if (!hubspotOwnerId) return null;
+  return prisma.userAccountLink.findUnique({ where: { hubspotOwnerId } });
+}
+
+async function resolveHubSpotOwnerIdForTask(task: Task): Promise<string | undefined> {
+  if (task.hubspotOwnerId) return task.hubspotOwnerId;
+
+  const linkedAssignee = await getUserAccountLinkBySlackUserId(task.assignedToUserId ?? task.createdByUserId);
+  if (linkedAssignee?.hubspotOwnerId) return linkedAssignee.hubspotOwnerId;
+
+  return resolveHubSpotOwnerId();
 }
 
 let ownerCache: { email: string; id: string } | null = null;
@@ -298,8 +391,8 @@ export async function resolveHubSpotOwnerId(): Promise<string | undefined> {
     return ownerCache.id;
   }
 
-  const owners = await hubspotFetch<{ results: HubSpotOwner[] }>(`/crm/v3/owners`, { method: 'GET' });
-  const match = (owners.results ?? []).find((owner) => (owner.email ?? '').toLowerCase() === env.HUBSPOT_OWNER_EMAIL?.toLowerCase());
+  const owners = await listHubSpotOwners();
+  const match = owners.find((owner) => (owner.email ?? '').toLowerCase() === env.HUBSPOT_OWNER_EMAIL?.toLowerCase());
   if (match?.id) {
     ownerCache = { email: env.HUBSPOT_OWNER_EMAIL, id: match.id };
     return match.id;
@@ -312,7 +405,7 @@ export async function createHubSpotTask(task: Task): Promise<{ hubspotTaskId: st
   if (!enabled()) return null;
 
   const company = await findCompanyForChannel({ channelId: task.creatorChannelId, channelName: task.creatorChannelName });
-  const ownerId = await resolveHubSpotOwnerId();
+  const ownerId = await resolveHubSpotOwnerIdForTask(task);
 
   const payload: Record<string, unknown> = {
     engagement: {
@@ -347,7 +440,7 @@ export async function createHubSpotTask(task: Task): Promise<{ hubspotTaskId: st
 
 export async function updateHubSpotTask(task: Task): Promise<void> {
   if (!enabled() || !task.hubspotTaskId) return;
-  const ownerId = await resolveHubSpotOwnerId();
+  const ownerId = await resolveHubSpotOwnerIdForTask(task);
 
   await hubspotFetch(`/engagements/v1/engagements/${task.hubspotTaskId}`, {
     method: 'PATCH',
