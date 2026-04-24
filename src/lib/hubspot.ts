@@ -370,6 +370,19 @@ export async function getUserAccountLinkByHubSpotOwnerId(hubspotOwnerId?: string
   if (!hubspotOwnerId) return null;
   return prisma.userAccountLink.findUnique({ where: { hubspotOwnerId } });
 }
+export async function setReminderPreferenceForSlackUser(slackUserId: string, enabled: boolean) {
+  return prisma.userAccountLink.update({
+    where: { slackUserId },
+    data: { remindersEnabled: enabled }
+  });
+}
+
+export async function listReminderEnabledUserAccountLinks() {
+  return prisma.userAccountLink.findMany({
+    where: { remindersEnabled: true }
+  });
+}
+
 
 async function resolveHubSpotOwnerIdForTask(task: Task): Promise<string | undefined> {
   if (task.hubspotOwnerId) return task.hubspotOwnerId;

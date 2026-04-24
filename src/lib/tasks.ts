@@ -233,3 +233,24 @@ export async function listUsersWithTasksDueToday(): Promise<string[]> {
     .map((row) => row.assignedToUserId)
     .filter((userId): userId is string => Boolean(userId));
 }
+
+export async function listTasksDueTodayForHubSpotOwner(hubspotOwnerId: string): Promise<Task[]> {
+  const { start, end } = todayRangeInTimezone();
+  return prisma.task.findMany({
+    where: {
+      hubspotOwnerId,
+      status: {
+        not: TaskStatus.DONE
+      },
+      dueDate: {
+        gte: start,
+        lte: end
+      }
+    },
+    orderBy: [
+      { dueDate: 'asc' },
+      { priority: 'desc' },
+      { createdAt: 'asc' }
+    ]
+  });
+}

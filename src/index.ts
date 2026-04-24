@@ -28,6 +28,7 @@ import {
   hubSpotOwnerDisplayName,
   linkSlackUserToHubSpotOwner,
   listHubSpotOwners,
+  setReminderPreferenceForSlackUser,
   saveChannelLink,
   searchCompanies,
   updateHubSpotTask
@@ -323,6 +324,41 @@ app.command('/link-hubspot', async ({ ack, command, respond }) => {
   await respond({
     response_type: 'ephemeral',
     text: `Linked your Slack account to HubSpot owner *${linked.hubspotOwnerName ?? linked.hubspotOwnerEmail ?? linked.hubspotOwnerId}*.`
+  });
+});
+
+app.command('/reminders', async ({ ack, command, respond }) => {
+  await ack();
+
+  const raw = command.text.trim().toLowerCase();
+  if (raw !== 'on' && raw !== 'off') {
+    const linked = await getUserAccountLinkBySlackUserId(command.user_id);
+    const status = linked?.remindersEnabled ? 'on' : 'off';
+    await respond({
+      response_type: 'ephemeral',
+      text: `Use \`/reminders on\` or \`/reminders off\`. Your reminders are currently *${status}*.`
+    });
+    return;
+  }
+
+  const linked = await getUserAccountLinkBySlackUserId(command.user_id);
+  if (!linked) {
+    await respond({
+      response_type: 'ephemeral',
+      text: 'Link your Slack account to your HubSpot owner first with `/link-hubspot your@email.com`, then run `/reminders on`.'
+    });
+    return;
+  }
+
+  const enabled = raw === 'on';
+  const updated = await setReminderPreferenceForSlackUser(command.user_id, enabled);
+  const ownerLabel = updated.hubspotOwnerName ?? updated.hubspotOwnerEmail ?? updated.hubspotOwnerId;
+
+  await respond({
+    response_type: 'ephemeral',
+    text: enabled
+      ? `Reminders are now *on* for tasks assigned to your HubSpot owner, *${ownerLabel}*.`
+      : `Reminders are now *off* for tasks assigned to your HubSpot owner, *${ownerLabel}*.`
   });
 });
 

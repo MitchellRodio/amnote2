@@ -57,6 +57,12 @@
         "description": "Link your Slack account to your HubSpot owner",
         "usage_hint": "/link-hubspot your@email.com",
         "should_escape": false
+      },
+      {
+        "command": "/reminders",
+        "description": "Turn task reminder DMs on or off",
+        "usage_hint": "/reminders on or /reminders off",
+        "should_escape": false
       }
     ],
     "shortcuts": [
