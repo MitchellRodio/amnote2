@@ -297,7 +297,7 @@ async function handleTaskModalSubmit(body: any, view: any, client: any, metadata
   const notes = view.state.values.task_notes?.value?.value ?? undefined;
   const priority = (view.state.values.priority?.value?.selected_option?.value as TaskPriority | undefined) ?? 'MEDIUM';
   const hubspotOwnerId = view.state.values.hubspot_owner?.value?.selected_option?.value as string | undefined;
-  const dueDate = parseDueDate(view.state.values.due_date?.value?.selected_date, view.state.values.due_time?.value?.value);
+  const dueDate = parseDueDate(view.state.values.due_date?.value?.selected_date ?? undefined, view.state.values.due_time?.value?.value ?? undefined);
 
   if (!title) {
     await client.chat.postEphemeral({ channel: metadata.channelId, user: body.user.id, text: 'Task title is required.' });
@@ -413,7 +413,7 @@ app.view('task_priority_modal_submit', async ({ ack, view, body, client }) => {
 app.view('task_due_date_modal_submit', async ({ ack, view, body, client }) => {
   await ack();
   const { taskId } = JSON.parse(view.private_metadata) as { taskId: string };
-  const due = parseDueDate(view.state.values.due_date.value.selected_date ?? undefined, view.state.values.due_time?.value?.value) ?? null;
+  const due = parseDueDate(view.state.values.due_date.value.selected_date ?? undefined, view.state.values.due_time?.value?.value ?? undefined) ?? null;
   const task = await updateHubSpotTaskDueDate(taskId, due);
   if (!task.slackChannelId) return;
   await client.chat.postEphemeral({ channel: task.slackChannelId, user: body.user.id, text: `Updated due date for "${task.title}".`, blocks: singleTaskBlocks(task) });
