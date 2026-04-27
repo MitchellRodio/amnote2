@@ -1,52 +1,97 @@
-# Creator Tasks, Stateless Slack to HubSpot
+# Creator Tasks, Railway Edition
 
-This version has no internal database. Slack commands read from Slack and HubSpot only. HubSpot is the source of truth for tasks, owners, and Slack channel to company links.
+Slack-native task manager for creator/account channels.
 
-## Required env vars
+This version is prepared for **Railway + Postgres** so you do not need to host it locally.
+
+## Stack
+- TypeScript
+- Node.js
+- Slack Bolt for JavaScript
+- Prisma
+- PostgreSQL
+- Socket Mode
+
+## What changed for Railway
+- Switched Prisma from SQLite to PostgreSQL
+- Added `postinstall` script so Prisma Client is generated during build
+- Added `railway.json` with a pre-deploy Prisma push and start command
+- Added `.env.railway.example`
+
+## Local dev
+1. Copy `.env.example` to `.env`
+2. Fill in:
+   - `DATABASE_URL`
+   - `SLACK_BOT_TOKEN`
+   - `SLACK_SIGNING_SECRET`
+   - `SLACK_APP_TOKEN`
+3. Run:
 
 ```bash
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...
-SLACK_SIGNING_SECRET=unused-in-socket-mode
-HUBSPOT_ACCESS_TOKEN=pat-na1-...
-HUBSPOT_SLACK_CHANNEL_OBJECT_TYPE=2-xxxxxxxx
+npm install
+npx prisma db push
+npm run dev
 ```
 
-Optional:
+## Railway deploy
+1. Push this project to GitHub
+2. In Railway, create a new project from your GitHub repo
+3. Add a PostgreSQL service to the project
+4. In the app service Variables tab, add:
+   - `DATABASE_URL` = reference the Postgres service's `DATABASE_URL`
+   - `SLACK_BOT_TOKEN`
+   - `SLACK_SIGNING_SECRET`
+   - `SLACK_APP_TOKEN`
+   - `TIMEZONE=America/New_York`
+   - `SLACK_LOG_LEVEL=info`
+5. Deploy
 
-```bash
-HUBSPOT_OWNER_ID=
-HUBSPOT_OWNER_EMAIL=
-HUBSPOT_TASK_TO_COMPANY_ASSOCIATION_TYPE_ID=192
-HUBSPOT_SLACK_CHANNEL_TO_COMPANY_ASSOCIATION_TYPE_ID=
-```
+Railway will:
+- install dependencies
+- run `postinstall` -> `prisma generate`
+- run pre-deploy command -> `npx prisma db push`
+- run start command -> `npm run start`
 
-## HubSpot properties used
+## Slack app requirements
+This app uses **Socket Mode**, so you need:
+- Bot token (`xoxb-...`)
+- App token (`xapp-...`) with `connections:write`
+- Signing secret
 
-Tasks need these custom properties if they do not already exist:
-
-- slack_channel_id
-- slack_channel_name
-- slack_user_id
-- slack_source_message_link
-- slack_context_snippet
-- hubspot_company_id
-- hubspot_company_name
-
-SlackChannel custom object properties:
-
-- channel_id
-- channel_name
-- company_id
+Socket Mode means you do **not** need ngrok or a public request URL.
 
 ## Commands
-
-- /link <company name> searches HubSpot companies, asks you to pick one, then stores the channel link in the HubSpot SlackChannel custom object.
-- /todo creates a HubSpot task for the linked company.
-- /todos lists your open HubSpot tasks in the current Slack channel.
-- /list lists your open HubSpot tasks across channels.
-- /mytodos same as /list.
+- `/todo <task>`
+- `/todos`
+- `/mytodos`
+- `/overdue`
+- `/today`
+- `/list`
 
 ## Notes
+- If you change the Prisma schema later, redeploy or run `npx prisma db push` again.
+- After adding a new slash command in Slack, reinstall the Slack app to your workspace.
 
-Slack email to HubSpot owner matching requires Slack to return user.profile.email from users.info. If your workspace does not grant email access, leave HUBSPOT_OWNER_ID or HUBSPOT_OWNER_EMAIL as a fallback, or pick an owner from the /todo dropdown.
+
+## HubSpot sync
+
+This app can mirror Slack tasks into HubSpot tasks and associate them to the matching company.
+
+### Required Railway variables
+
+- `HUBSPOT_ACCESS_TOKEN`
+- `HUBSPOT_BASE_URL` (leave as `https://api.hubapi.com`)
+- `HUBSPOT_CHANNEL_PREFIXES` (default: `whop-x-,whop-`)
+- `HUBSPOT_COMPANY_OVERRIDES` JSON for edge cases, example: `{"whop-x-toolsuite":"ToolSuite"}`
+
+### Matching logic
+
+For a Slack channel like `whop-x-trust-my-system`, the app strips the prefix, searches HubSpot for variants like `trust-my-system`, `trust my system`, and `Trust My System`, then stores the matched HubSpot company on the local task. Use `HUBSPOT_COMPANY_OVERRIDES` for weird names or exact IDs.
+
+### HubSpot private app scopes
+
+Create a HubSpot private app token with read/write access to companies and tasks. Then add the token to Railway as `HUBSPOT_ACCESS_TOKEN`.
+
+### Important
+
+After pulling this version, run `npx prisma db push` locally if you are testing locally, or redeploy on Railway so Prisma can add the new HubSpot fields to the `Task` table.
