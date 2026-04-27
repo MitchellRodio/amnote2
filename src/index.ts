@@ -413,7 +413,7 @@ app.view('task_priority_modal_submit', async ({ ack, view, body, client }) => {
 app.view('task_due_date_modal_submit', async ({ ack, view, body, client }) => {
   await ack();
   const { taskId } = JSON.parse(view.private_metadata) as { taskId: string };
-  const due = parseDueDate(view.state.values.due_date.value.selected_date, view.state.values.due_time?.value?.value) ?? null;
+  const due = parseDueDate(view.state.values.due_date.value.selected_date ?? undefined, view.state.values.due_time?.value?.value) ?? null;
   const task = await updateHubSpotTaskDueDate(taskId, due);
   if (!task.slackChannelId) return;
   await client.chat.postEphemeral({ channel: task.slackChannelId, user: body.user.id, text: `Updated due date for "${task.title}".`, blocks: singleTaskBlocks(task) });
